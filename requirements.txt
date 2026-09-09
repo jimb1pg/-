@@ -6,3 +6,4 @@ numpy
 FinMind
 tqdm
 transformers
+scikit-learn
