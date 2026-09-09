@@ -2116,7 +2116,7 @@ with tab4:
         with state_c1:
             with st.container(border=True):
                 st.subheader("🧭 KMeans 市場狀態")
-                st.metric("目前 Cluster", latest_cluster)
+                st.metric("目前 Cluster", f"{state_icon} {latest_state}")
                 st.markdown(f"### {state_icon} {latest_state}")
                 st.dataframe(result["cluster_summary"].round(4), use_container_width=True)
         with state_c2:
