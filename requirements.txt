@@ -7,3 +7,5 @@ FinMind
 tqdm
 transformers
 scikit-learn
+tensorflow
+python-dateutil
