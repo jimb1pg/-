@@ -2113,10 +2113,10 @@ with tab4:
             st.caption("🔴🟢 歷史 K 線　　🔵 AI 預測上漲　　🟠 AI 預測下跌　　虛線為歷史 / 預測分界")
 
         state_c1, state_c2 = st.columns([1, 1.6])
-        with state_c1:
-            with st.container(border=True):
-                st.subheader("🧭 KMeans 市場型態")
-                st.metric("目前市場型態", f"{state_icon} {latest_state}")
+        # with state_c1:
+            # with st.container(border=True):
+                # st.subheader("🧭 KMeans 市場型態")
+                # st.metric("目前市場型態", f"{state_icon} {latest_state}")
                 # st.dataframe( result["cluster_summary"].round(4), use_container_width=True)
         with state_c2:
             with st.container(border=True):
