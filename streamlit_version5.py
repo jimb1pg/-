@@ -2036,14 +2036,12 @@ with tab4:
         with ai_c3:
             ai_years = st.selectbox("模型歷史資料：", [3, 5, 7, 10], index=1, format_func=lambda x: f"近 {x} 年", key="ai_years")
 
-        """
-        st.markdown("**🧠 Version 5 模型設定**")
-        model_c1, model_c2, model_c3, model_c4 = st.columns(4)
-        with model_c1: st.metric("輸入窗口", f"{LOOKBACK_DAYS} 交易日")
-        with model_c2: st.metric("預測區間", f"{FORECAST_DAYS} 交易日")
-        with model_c3: st.metric("KMeans", f"{KMEANS_CLUSTERS} 狀態")
-        with model_c4: st.metric("預測目標", "OHLC")
-        """
+        # st.markdown("**🧠 Version 5 模型設定**")
+        # model_c1, model_c2, model_c3, model_c4 = st.columns(4)
+        # with model_c1: st.metric("輸入窗口", f"{LOOKBACK_DAYS} 交易日")
+        # with model_c2: st.metric("預測區間", f"{FORECAST_DAYS} 交易日")
+        # with model_c3: st.metric("KMeans", f"{KMEANS_CLUSTERS} 狀態")
+        # with model_c4: st.metric("預測目標", "OHLC")
 
         ai_button = st.button("🚀 執行 Version 5 AI 預測", use_container_width=True, key="ai_btn")
 
