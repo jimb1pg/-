@@ -1256,7 +1256,7 @@ FEATURE_COLUMNS = [
 #
 TARGET_COLUMNS = ["Open_Return", "High_Return", "Low_Return", "Close_Return"]
 
-
+#
 def create_tcn_dataset(
     df: pd.DataFrame,
     lookback: int = LOOKBACK_DAYS,
@@ -1264,9 +1264,22 @@ def create_tcn_dataset(
 ):
     """
     X：過去 60 天特徵
-    y：未來 22 天 OHLC
+    y：未來 22 天 OHLC 報酬率
     """
-    clean = df.dropna(
+
+    clean = df.copy()
+
+    # ==========================================
+    # 建立 OHLC 相對前一交易日 Close 的報酬率
+    # ==========================================
+    previous_close = clean["Close"].shift(1)
+
+    clean["Open_Return"] = clean["Open"] / previous_close - 1
+    clean["High_Return"] = clean["High"] / previous_close - 1
+    clean["Low_Return"] = clean["Low"] / previous_close - 1
+    clean["Close_Return"] = clean["Close"] / previous_close - 1
+
+    clean = clean.dropna(
         subset=FEATURE_COLUMNS + TARGET_COLUMNS
     ).copy()
 
@@ -1281,6 +1294,10 @@ def create_tcn_dataset(
     feature_values = feature_scaler.fit_transform(
         clean[FEATURE_COLUMNS]
     )
+
+    # ==========================================
+    # 模型現在學習的是「報酬率」
+    # ==========================================
     target_values = target_scaler.fit_transform(
         clean[TARGET_COLUMNS]
     )
@@ -1298,12 +1315,12 @@ def create_tcn_dataset(
             feature_values[start_idx:end_idx]
         )
 
-        future_ohlc = target_values[
+        future_return = target_values[
             end_idx:end_idx + horizon
         ]
 
         y_list.append(
-            future_ohlc.reshape(-1)
+            future_return.reshape(-1)
         )
 
     X = np.asarray(x_list, dtype=np.float32)
