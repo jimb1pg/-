@@ -1412,7 +1412,7 @@ def build_tcn_model(
 
     outputs = Dense(
         horizon * 4,
-        name="future_ohlc"
+        name="future_returns"
     )(x)
 
     model = tf.keras.Model(
