@@ -1253,7 +1253,8 @@ FEATURE_COLUMNS = [
     "sentiment_score"
 ]
 
-TARGET_COLUMNS = ["Open", "High", "Low", "Close"]
+#
+TARGET_COLUMNS = ["Open_Return", "High_Return", "Low_Return", "Close_Return"]
 
 
 def create_tcn_dataset(
