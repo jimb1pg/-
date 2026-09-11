@@ -1536,12 +1536,16 @@ def predict_future_ohlc(
     lookback: int = LOOKBACK_DAYS,
     horizon: int = FORECAST_DAYS
 ) -> pd.DataFrame:
+
     x_latest = make_latest_input(
         clean_df,
         feature_scaler,
         lookback
     )
 
+    # ==========================================
+    # TCN 預測未來 22 天報酬率
+    # ==========================================
     pred_scaled = model.predict(
         x_latest,
         verbose=0
@@ -1551,15 +1555,69 @@ def predict_future_ohlc(
         horizon, 4
     )
 
-    pred_ohlc = target_scaler.inverse_transform(
+    # 還原成實際報酬率
+    pred_returns = target_scaler.inverse_transform(
         pred_scaled
     )
 
-    last_close = float(clean_df["Close"].iloc[-1])
+    # ==========================================
+    # 限制每日報酬率在 -10% ~ +10%
+    # ==========================================
+    pred_returns = np.clip(
+        pred_returns,
+        -0.10,
+        0.10
+    )
 
-    pred_ohlc = repair_ohlc(
-        pred_ohlc,
-        last_close
+    last_close = float(
+        clean_df["Close"].iloc[-1]
+    )
+
+    # ==========================================
+    # 將報酬率還原成 OHLC 價格
+    # ==========================================
+    forecast_ohlc = []
+
+    previous_close = last_close
+
+    for i in range(horizon):
+
+        open_return = pred_returns[i, 0]
+        high_return = pred_returns[i, 1]
+        low_return = pred_returns[i, 2]
+        close_return = pred_returns[i, 3]
+
+        open_p = previous_close * (1 + open_return)
+        high_p = previous_close * (1 + high_return)
+        low_p = previous_close * (1 + low_return)
+        close_p = previous_close * (1 + close_return)
+
+        # 確保 K 線邏輯合理
+        high_p = max(
+            high_p,
+            open_p,
+            close_p
+        )
+
+        low_p = min(
+            low_p,
+            open_p,
+            close_p
+        )
+
+        forecast_ohlc.append([
+            open_p,
+            high_p,
+            low_p,
+            close_p
+        ])
+
+        # 下一天以上一天預測 Close 為基準
+        previous_close = close_p
+
+    forecast_ohlc = np.asarray(
+        forecast_ohlc,
+        dtype=float
     )
 
     future_dates = pd.bdate_range(
@@ -1568,14 +1626,17 @@ def predict_future_ohlc(
     )
 
     forecast = pd.DataFrame(
-        pred_ohlc,
+        forecast_ohlc,
         index=future_dates,
-        columns=TARGET_COLUMNS
+        columns=["Open", "High", "Low", "Close"]
     )
 
     forecast["Volume"] = 0.0
 
-    previous_close = pd.concat([
+    # ==========================================
+    # 每日 Close 報酬率
+    # ==========================================
+    previous_close_series = pd.concat([
         pd.Series(
             [last_close],
             index=[clean_df.index[-1]]
@@ -1584,8 +1645,16 @@ def predict_future_ohlc(
     ])
 
     forecast["Return"] = (
-        forecast["Close"].to_numpy() /
-        previous_close.iloc[:-1].to_numpy() - 1
+        forecast["Close"].to_numpy()
+        / previous_close_series.iloc[:-1].to_numpy()
+        - 1
+    )
+
+    # 再保險一次，確保顯示的每日報酬率一定在 ±10%
+    forecast["Return"] = np.clip(
+        forecast["Return"],
+        -0.10,
+        0.10
     )
 
     return forecast
