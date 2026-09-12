@@ -2182,8 +2182,11 @@ with tab4:
 
         with st.container(border=True):
             st.subheader("📊 歷史 K 線 + 未來 22 交易日 AI 預測")
-            hist_days = st.slider("歷史 K 線顯示天數", 10, 60, 22, key="ai_hist_days")
-            historical = stock_df[["Open", "High", "Low", "Close", "Volume"]].tail(hist_days).copy()
+            #
+            forecast_days = st.slider("未來預測顯示天數", min_value=1, max_value=22, value=22, key="ai_forecast_days")
+            historical = stock_df[["Open", "High", "Low", "Close", "Volume"]].tail(22).copy()
+            display_forecast = forecast_df.head(forecast_days)
+            
             # 合併歷史與預測的所有交易日期
             all_trading_dates = historical.index.union(forecast_df.index)
             # 建立完整日曆日期
@@ -2196,11 +2199,11 @@ with tab4:
             fig_ai.add_trace(go.Candlestick(x=historical.index, open=historical["Open"], high=historical["High"], low=historical["Low"], close=historical["Close"], name="歷史 K 線", increasing_line_color="red", increasing_fillcolor="red", decreasing_line_color="green", decreasing_fillcolor="green"), row=1, col=1)
             fig_ai.add_trace(go.Bar(x=historical.index, y=historical["Volume"], name="歷史成交量", marker_color=["red" if c >= o else "green" for c, o in zip(historical["Close"], historical["Open"])], opacity=0.65), row=2, col=1)
             # 以 Scatter + Bar 手動畫出 Version 5 的藍漲 / 橘跌預測 K 線
-            for i, (dt, row) in enumerate(forecast_df.iterrows()):
+            for i, (dt, row) in enumerate(display_forecast.iterrows()):
                 color = "blue" if row["Close"] >= row["Open"] else "orange"
                 fig_ai.add_trace(go.Scatter(x=[dt, dt], y=[row["Low"], row["High"]], mode="lines", line=dict(color=color, width=2), showlegend=False, hoverinfo="skip"), row=1, col=1)
                 fig_ai.add_trace(go.Bar(x=[dt], y=[row["Close"] - row["Open"]], base=[min(row["Open"], row["Close"])], width=0.55 * 24 * 60 * 60 * 1000, marker_color=color, name="AI 預測" if i == 0 else None, showlegend=(i == 0), hovertemplate=f"日期: {dt.strftime('%Y-%m-%d')}<br>開盤: {row['Open']:.2f}<br>最高: {row['High']:.2f}<br>最低: {row['Low']:.2f}<br>收盤: {row['Close']:.2f}<br>預測報酬: {row['Return'] * 100:+.2f}%<extra></extra>"), row=1, col=1)
-            fig_ai.add_vline(x=forecast_df.index[0], line_dash="dash", line_color="gray", row=1, col=1)
+            fig_ai.add_vline(x=display_forecast.index[0], line_dash="dash", line_color="gray", row=1, col=1)
             fig_ai.update_layout(title=f"{result['target']} 歷史 K 線與 AI 預測 | KMeans：{latest_state}", height=680, template="plotly_white", hovermode="x unified", xaxis_rangeslider_visible=False, xaxis=dict(rangebreaks=[dict(values=dt_breaks)]))
             fig_ai.update_yaxes(title_text="價格", row=1, col=1)
             fig_ai.update_yaxes(title_text="成交量", row=2, col=1)
