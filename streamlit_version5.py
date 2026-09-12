@@ -2183,8 +2183,16 @@ with tab4:
         with st.container(border=True):
             st.subheader("📊 歷史 K 線 + 未來 22 交易日 AI 預測")
             #
-            forecast_days = st.slider("未來預測顯示天數", min_value=1, max_value=22, value=22, key="ai_forecast_days")
-            historical = stock_df[["Open", "High", "Low", "Close", "Volume"]].tail(22).copy()
+            forecast_days = st.slider("未來預測顯示天數", min_value=1, max_value=FORECAST_DAYS, value=22, key="ai_forecast_days")
+            
+            # K 線總共固定顯示 44 個交易日
+            TOTAL_DISPLAY_DAYS = 44
+            
+            # 預測幾天，就相應減少歷史天數
+            hist_days = TOTAL_DISPLAY_DAYS - forecast_days
+            
+            historical = stock_df[["Open", "High", "Low", "Close", "Volume"]].tail(hist_days).copy()
+
             display_forecast = forecast_df.head(forecast_days)
             
             # 合併歷史與預測的所有交易日期
