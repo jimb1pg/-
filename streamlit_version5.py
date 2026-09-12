@@ -2207,6 +2207,15 @@ with tab4:
             st.plotly_chart(fig_ai, use_container_width=True)
             st.caption("🔴🟢 歷史 K 線　　🔵 AI 預測上漲　　🟠 AI 預測下跌　　虛線為歷史 / 預測分界")
 
+        with st.container(border=True):
+            st.subheader("🔮 未來 22 交易日預測明細")
+            output = forecast_df.copy()
+            output.insert(0, "日期", output.index.strftime("%Y-%m-%d"))
+            output["預測漲跌幅(%)"] = output["Return"] * 100
+            output = output.rename(columns={"Open": "預測開盤", "High": "預測最高", "Low": "預測最低", "Close": "預測收盤"})
+            output = output[["日期", "預測開盤", "預測最高", "預測最低", "預測收盤", "預測漲跌幅(%)"]]
+            st.dataframe(output, use_container_width=True, hide_index=True, column_config={"預測開盤": st.column_config.NumberColumn(format="%.2f"), "預測最高": st.column_config.NumberColumn(format="%.2f"), "預測最低": st.column_config.NumberColumn(format="%.2f"), "預測收盤": st.column_config.NumberColumn(format="%.2f"), "預測漲跌幅(%)": st.column_config.NumberColumn(format="%+.2f %%")})
+        
         state_c1, state_c2 = st.columns([1, 1.6])
         # with state_c1:
             # with st.container(border=True):
@@ -2240,12 +2249,3 @@ with tab4:
                 if "val_loss" in history_obj: fig_loss.add_trace(go.Scatter(y=history_obj["val_loss"], mode="lines", name="Validation Loss"))
                 fig_loss.update_layout(title="TCN 訓練 / 驗證 Loss", height=320, template="plotly_white", xaxis_title="Epoch", yaxis_title="MSE Loss")
                 st.plotly_chart(fig_loss, use_container_width=True)
-
-        with st.container(border=True):
-            st.subheader("🔮 未來 22 交易日預測明細")
-            output = forecast_df.copy()
-            output.insert(0, "日期", output.index.strftime("%Y-%m-%d"))
-            output["預測漲跌幅(%)"] = output["Return"] * 100
-            output = output.rename(columns={"Open": "預測開盤", "High": "預測最高", "Low": "預測最低", "Close": "預測收盤"})
-            output = output[["日期", "預測開盤", "預測最高", "預測最低", "預測收盤", "預測漲跌幅(%)"]]
-            st.dataframe(output, use_container_width=True, hide_index=True, column_config={"預測開盤": st.column_config.NumberColumn(format="%.2f"), "預測最高": st.column_config.NumberColumn(format="%.2f"), "預測最低": st.column_config.NumberColumn(format="%.2f"), "預測收盤": st.column_config.NumberColumn(format="%.2f"), "預測漲跌幅(%)": st.column_config.NumberColumn(format="%+.2f %%")})
