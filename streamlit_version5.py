@@ -2203,9 +2203,9 @@ with tab4:
             # 找出沒有交易的日期
             dt_breaks = list(set(dt_all.strftime("%Y-%m-%d")) - set(all_trading_dates.strftime("%Y-%m-%d")))
 
-            fig_ai = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.72, 0.28], row_titles=["價格", "成交量"])
+            fig_ai = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.72, 0.28], row_titles=["價格"])
             fig_ai.add_trace(go.Candlestick(x=historical.index, open=historical["Open"], high=historical["High"], low=historical["Low"], close=historical["Close"], name="歷史 K 線", increasing_line_color="red", increasing_fillcolor="red", decreasing_line_color="green", decreasing_fillcolor="green"), row=1, col=1)
-            fig_ai.add_trace(go.Bar(x=historical.index, y=historical["Volume"], name="歷史成交量", marker_color=["red" if c >= o else "green" for c, o in zip(historical["Close"], historical["Open"])], opacity=0.65), row=2, col=1)
+            # fig_ai.add_trace(go.Bar(x=historical.index, y=historical["Volume"], name="歷史成交量", marker_color=["red" if c >= o else "green" for c, o in zip(historical["Close"], historical["Open"])], opacity=0.65), row=2, col=1)
             # 以 Scatter + Bar 手動畫出 Version 5 的藍漲 / 橘跌預測 K 線
             for i, (dt, row) in enumerate(display_forecast.iterrows()):
                 color = "blue" if row["Close"] >= row["Open"] else "orange"
