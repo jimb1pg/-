@@ -33,6 +33,8 @@ import tensorflow as tf
 from tensorflow.keras.layers import Conv1D, Dense, Dropout, BatchNormalization, GlobalAveragePooling1D, Add
 from tensorflow.keras.callbacks import EarlyStopping
 
+import torch
+
 RANDOM_SEED = 42
 LOOKBACK_DAYS = 60
 FORECAST_DAYS = 22
