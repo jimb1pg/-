@@ -1254,86 +1254,55 @@ FEATURE_COLUMNS = [
 ]
 
 #
-TARGET_COLUMNS = ["Open_Return", "High_Return", "Low_Return", "Close_Return"]
+TARGET_COLUMNS = ["Close_Return", "Open_Offset", "High_Spread", "Low_Spread"]
 
-#
 def create_tcn_dataset(
     df: pd.DataFrame,
     lookback: int = LOOKBACK_DAYS,
     horizon: int = FORECAST_DAYS
 ):
-    """
-    X：過去 60 天特徵
-    y：未來 22 天 OHLC 報酬率
-    """
-
     clean = df.copy()
-
-    # ==========================================
-    # 建立 OHLC 相對前一交易日 Close 的報酬率
-    # ==========================================
+    
     previous_close = clean["Close"].shift(1)
-
-    clean["Open_Return"] = clean["Open"] / previous_close - 1
-    clean["High_Return"] = clean["High"] / previous_close - 1
-    clean["Low_Return"] = clean["Low"] / previous_close - 1
+    
+    # 1. 主預測目標：收盤價相對前日收盤的報酬率
     clean["Close_Return"] = clean["Close"] / previous_close - 1
+    
+    # 2. 開盤價相對前日收盤的跳空幅度
+    clean["Open_Offset"] = clean["Open"] / previous_close - 1
+    
+    # 3. 上影線長度（相對於當天實體高點的延伸比例，恆為非負數）
+    body_high = np.maximum(clean["Open"], clean["Close"])
+    clean["High_Spread"] = (clean["High"] - body_high) / previous_close
+    
+    # 4. 下影線長度（相對於當天實體低點的延伸比例，恆為非負數）
+    body_low = np.minimum(clean["Open"], clean["Close"])
+    clean["Low_Spread"] = (body_low - clean["Low"]) / previous_close
 
-    clean = clean.dropna(
-        subset=FEATURE_COLUMNS + TARGET_COLUMNS
-    ).copy()
-
+    clean = clean.dropna(subset=FEATURE_COLUMNS + TARGET_COLUMNS).copy()
+    
     if len(clean) < lookback + horizon + 30:
-        raise ValueError(
-            f"資料不足，至少需要 {lookback + horizon + 30} 筆有效交易日。"
-        )
+        raise ValueError(f"資料不足，至少需要 {lookback + horizon + 30} 筆有效交易日。")
 
     feature_scaler = MinMaxScaler()
-    target_scaler = MinMaxScaler()
+    
+    # 【核心修正】將 target_scaler 改為 StandardScaler，避免極值被推到 0~1 的邊界
+    target_scaler = StandardScaler()
 
-    feature_values = feature_scaler.fit_transform(
-        clean[FEATURE_COLUMNS]
-    )
+    feature_values = feature_scaler.fit_transform(clean[FEATURE_COLUMNS])
+    target_values = target_scaler.fit_transform(clean[TARGET_COLUMNS])
 
-    # ==========================================
-    # 模型現在學習的是「報酬率」
-    # ==========================================
-    target_values = target_scaler.fit_transform(
-        clean[TARGET_COLUMNS]
-    )
-
-    x_list = []
-    y_list = []
-
-    for end_idx in range(
-        lookback,
-        len(clean) - horizon + 1
-    ):
+    x_list, y_list = [], []
+    for end_idx in range(lookback, len(clean) - horizon + 1):
         start_idx = end_idx - lookback
-
-        x_list.append(
-            feature_values[start_idx:end_idx]
-        )
-
-        future_return = target_values[
-            end_idx:end_idx + horizon
-        ]
-
-        y_list.append(
-            future_return.reshape(-1)
-        )
+        x_list.append(feature_values[start_idx:end_idx])
+        future_return = target_values[end_idx:end_idx + horizon]
+        y_list.append(future_return.reshape(-1))
 
     X = np.asarray(x_list, dtype=np.float32)
     y = np.asarray(y_list, dtype=np.float32)
 
-    return (
-        X,
-        y,
-        clean,
-        feature_scaler,
-        target_scaler
-    )
-
+    return X, y, clean, feature_scaler, target_scaler
 
 def tcn_residual_block(
     x,
@@ -1532,132 +1501,69 @@ def predict_future_ohlc(
     model,
     clean_df: pd.DataFrame,
     feature_scaler: MinMaxScaler,
-    target_scaler: MinMaxScaler,
+    target_scaler: StandardScaler,
     lookback: int = LOOKBACK_DAYS,
     horizon: int = FORECAST_DAYS
 ) -> pd.DataFrame:
+    x_latest = make_latest_input(clean_df, feature_scaler, lookback)
 
-    x_latest = make_latest_input(
-        clean_df,
-        feature_scaler,
-        lookback
-    )
+    # 模型預測未來 22 天的標準化目標值
+    pred_scaled = model.predict(x_latest, verbose=0)[0]
+    pred_scaled = pred_scaled.reshape(horizon, 4)
 
-    # ==========================================
-    # TCN 預測未來 22 天報酬率
-    # ==========================================
-    pred_scaled = model.predict(
-        x_latest,
-        verbose=0
-    )[0]
+    # 反標準化還原成真實數值
+    pred_targets = target_scaler.inverse_transform(pred_scaled)
 
-    pred_scaled = pred_scaled.reshape(
-        horizon, 4
-    )
-
-    # 還原成實際報酬率
-    pred_returns = target_scaler.inverse_transform(
-        pred_scaled
-    )
-
-    # ==========================================
-    # 限制每日報酬率在 -10% ~ +10%
-    # ==========================================
-    pred_returns = np.clip(
-        pred_returns,
-        -0.10,
-        0.10
-    )
-
-    last_close = float(
-        clean_df["Close"].iloc[-1]
-    )
-
-    # ==========================================
-    # 將報酬率還原成 OHLC 價格
-    # ==========================================
+    last_close = float(clean_df["Close"].iloc[-1])
     forecast_ohlc = []
-
     previous_close = last_close
 
     for i in range(horizon):
+        close_ret = pred_targets[i, 0]
+        open_off = pred_targets[i, 1]
+        high_spread = max(0, pred_targets[i, 2]) # 影線長度不可為負
+        low_spread = max(0, pred_targets[i, 3])  # 影線長度不可為負
 
-        open_return = pred_returns[i, 0]
-        high_return = pred_returns[i, 1]
-        low_return = pred_returns[i, 2]
-        close_return = pred_returns[i, 3]
+        # 【核心修正】限制 0050 單日合理漲跌幅（例如 ±3.5%）
+        close_ret = np.clip(close_ret, -0.035, 0.035)
+        open_off = np.clip(open_off, -0.02, 0.02)
 
-        open_p = previous_close * (1 + open_return)
-        high_p = previous_close * (1 + high_return)
-        low_p = previous_close * (1 + low_return)
-        close_p = previous_close * (1 + close_return)
+        # 1. 算出當天預測的 Close 與 Open
+        close_p = previous_close * (1 + close_ret)
+        open_p = previous_close * (1 + open_off)
 
-        # 確保 K 線邏輯合理
-        high_p = max(
-            high_p,
-            open_p,
-            close_p
-        )
+        # 2. 確定 K 線實體的頂部與底部
+        body_high = max(open_p, close_p)
+        body_low = min(open_p, close_p)
 
-        low_p = min(
-            low_p,
-            open_p,
-            close_p
-        )
+        # 3. 疊加影線算出 High 與 Low（合理微幅擴張）
+        high_p = body_high + (previous_close * high_spread)
+        low_p = body_low - (previous_close * low_spread)
 
-        forecast_ohlc.append([
-            open_p,
-            high_p,
-            low_p,
-            close_p
-        ])
+        # 確保價格不為負值
+        open_p = max(open_p, 0.01)
+        high_p = max(high_p, open_p, close_p)
+        low_p = max(0.01, min(low_p, open_p, close_p))
+        close_p = max(close_p, 0.01)
 
-        # 下一天以上一天預測 Close 為基準
+        forecast_ohlc.append([open_p, high_p, low_p, close_p])
+
+        # 滾動前日收盤價至下一天
         previous_close = close_p
 
-    forecast_ohlc = np.asarray(
-        forecast_ohlc,
-        dtype=float
-    )
+    # 建立日期與預測 DataFrame 邏輯維持原樣...
+    last_date = pd.to_datetime(clean_df["Date"].iloc[-1])
+    future_dates = []
+    curr = last_date + pd.Timedelta(days=1)
+    
+    while len(future_dates) < horizon:
+        if curr.weekday() < 5:
+            future_dates.append(curr)
+        curr += pd.Timedelta(days=1)
 
-    future_dates = pd.bdate_range(
-        start=clean_df.index[-1] + pd.Timedelta(days=1),
-        periods=horizon
-    )
-
-    forecast = pd.DataFrame(
-        forecast_ohlc,
-        index=future_dates,
-        columns=["Open", "High", "Low", "Close"]
-    )
-
-    forecast["Volume"] = 0.0
-
-    # ==========================================
-    # 每日 Close 報酬率
-    # ==========================================
-    previous_close_series = pd.concat([
-        pd.Series(
-            [last_close],
-            index=[clean_df.index[-1]]
-        ),
-        forecast["Close"]
-    ])
-
-    forecast["Return"] = (
-        forecast["Close"].to_numpy()
-        / previous_close_series.iloc[:-1].to_numpy()
-        - 1
-    )
-
-    # 再保險一次，確保顯示的每日報酬率一定在 ±10%
-    forecast["Return"] = np.clip(
-        forecast["Return"],
-        -0.10,
-        0.10
-    )
-
-    return forecast
+    pred_df = pd.DataFrame(forecast_ohlc, columns=["Open", "High", "Low", "Close"])
+    pred_df.insert(0, "Date", future_dates)
+    return pred_df
 
 
 # ============================================================
