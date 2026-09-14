@@ -9,4 +9,3 @@ transformers
 scikit-learn
 tensorflow
 python-dateutil
-torch
