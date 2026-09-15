@@ -1269,20 +1269,18 @@ def create_tcn_dataset(
 
     clean = df.copy()
 
-    # ==========================================
-    # 建立 OHLC 相對前一交易日 Close 的報酬率
-    # ==========================================
+    # 計算 OHLC 相對前一交易日收盤價的報酬率
     previous_close = clean["Close"].shift(1)
-
+    
     clean["Open_Return"] = clean["Open"] / previous_close - 1
     clean["High_Return"] = clean["High"] / previous_close - 1
     clean["Low_Return"] = clean["Low"] / previous_close - 1
     clean["Close_Return"] = clean["Close"] / previous_close - 1
-
     clean = clean.dropna(
         subset=FEATURE_COLUMNS + TARGET_COLUMNS
     ).copy()
 
+    
     if len(clean) < lookback + horizon + 30:
         raise ValueError(
             f"資料不足，至少需要 {lookback + horizon + 30} 筆有效交易日。"
@@ -1543,9 +1541,6 @@ def predict_future_ohlc(
         lookback
     )
 
-    # ==========================================
-    # TCN 預測未來 22 天報酬率
-    # ==========================================
     pred_scaled = model.predict(
         x_latest,
         verbose=0
@@ -1555,30 +1550,22 @@ def predict_future_ohlc(
         horizon, 4
     )
 
-    # 還原成實際報酬率
+    # 還原成 OHLC 報酬率
     pred_returns = target_scaler.inverse_transform(
         pred_scaled
     )
 
-    # ==========================================
-    # 限制每日報酬率在 -10% ~ +10%
-    # ==========================================
+    # 每日報酬率限制在 -10% ~ +10%
     pred_returns = np.clip(
         pred_returns,
         -0.10,
         0.10
     )
 
-    last_close = float(
-        clean_df["Close"].iloc[-1]
-    )
-
-    # ==========================================
-    # 將報酬率還原成 OHLC 價格
-    # ==========================================
-    forecast_ohlc = []
-
+    last_close = float(clean_df["Close"].iloc[-1])
     previous_close = last_close
+
+    predicted_ohlc = []
 
     for i in range(horizon):
 
@@ -1587,6 +1574,7 @@ def predict_future_ohlc(
         low_return = pred_returns[i, 2]
         close_return = pred_returns[i, 3]
 
+        # 由前一天收盤價還原今天價格
         open_p = previous_close * (1 + open_return)
         high_p = previous_close * (1 + high_return)
         low_p = previous_close * (1 + low_return)
@@ -1605,20 +1593,15 @@ def predict_future_ohlc(
             close_p
         )
 
-        forecast_ohlc.append([
+        predicted_ohlc.append([
             open_p,
             high_p,
             low_p,
             close_p
         ])
 
-        # 下一天以上一天預測 Close 為基準
+        # 下一天以今天預測收盤作為基準
         previous_close = close_p
-
-    forecast_ohlc = np.asarray(
-        forecast_ohlc,
-        dtype=float
-    )
 
     future_dates = pd.bdate_range(
         start=clean_df.index[-1] + pd.Timedelta(days=1),
@@ -1626,31 +1609,26 @@ def predict_future_ohlc(
     )
 
     forecast = pd.DataFrame(
-        forecast_ohlc,
+        predicted_ohlc,
         index=future_dates,
         columns=["Open", "High", "Low", "Close"]
     )
 
     forecast["Volume"] = 0.0
 
-    # ==========================================
-    # 每日 Close 報酬率
-    # ==========================================
-    previous_close_series = pd.concat([
-        pd.Series(
-            [last_close],
-            index=[clean_df.index[-1]]
-        ),
-        forecast["Close"]
+    # 計算每日預測報酬率
+    previous_closes = np.concatenate([
+        [last_close],
+        forecast["Close"].iloc[:-1].to_numpy()
     ])
 
     forecast["Return"] = (
         forecast["Close"].to_numpy()
-        / previous_close_series.iloc[:-1].to_numpy()
+        / previous_closes
         - 1
     )
 
-    # 再保險一次，確保顯示的每日報酬率一定在 ±10%
+    # 再保險一次，限制每日報酬率
     forecast["Return"] = np.clip(
         forecast["Return"],
         -0.10,
