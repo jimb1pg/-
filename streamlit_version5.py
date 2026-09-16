@@ -1253,9 +1253,8 @@ FEATURE_COLUMNS = [
     "sentiment_score"
 ]
 
-#
-TARGET_COLUMNS = ["Open_Return", "High_Return", "Low_Return", "Close_Return"]
-
+# TCN 只預測「收盤價報酬率」
+TARGET_COLUMNS = ["Close_Return"]
 #
 def create_tcn_dataset(
     df: pd.DataFrame,
@@ -1264,28 +1263,36 @@ def create_tcn_dataset(
 ):
     """
     X：過去 60 天特徵
-    y：未來 22 天 OHLC 報酬率
+    y：未來 22 天 Close 報酬率
+
+    Close_Return =
+        今日 Close / 昨日 Close - 1
     """
 
     clean = df.copy()
 
-    # 計算 OHLC 相對前一交易日收盤價的報酬率
-    previous_close = clean["Close"].shift(1)
-    
-    clean["Open_Return"] = clean["Open"] / previous_close - 1
-    clean["High_Return"] = clean["High"] / previous_close - 1
-    clean["Low_Return"] = clean["Low"] / previous_close - 1
-    clean["Close_Return"] = clean["Close"] / previous_close - 1
+    # ========================================================
+    # 建立 Close 報酬率
+    # ========================================================
+    clean["Close_Return"] = (
+        clean["Close"] /
+        clean["Close"].shift(1) - 1
+    )
+
+    # 移除無效資料
     clean = clean.dropna(
         subset=FEATURE_COLUMNS + TARGET_COLUMNS
     ).copy()
 
-    
     if len(clean) < lookback + horizon + 30:
         raise ValueError(
-            f"資料不足，至少需要 {lookback + horizon + 30} 筆有效交易日。"
+            f"資料不足，至少需要 "
+            f"{lookback + horizon + 30} 筆有效交易日。"
         )
 
+    # ========================================================
+    # 特徵縮放
+    # ========================================================
     feature_scaler = MinMaxScaler()
     target_scaler = MinMaxScaler()
 
@@ -1293,9 +1300,6 @@ def create_tcn_dataset(
         clean[FEATURE_COLUMNS]
     )
 
-    # ==========================================
-    # 模型現在學習的是「報酬率」
-    # ==========================================
     target_values = target_scaler.fit_transform(
         clean[TARGET_COLUMNS]
     )
@@ -1303,26 +1307,39 @@ def create_tcn_dataset(
     x_list = []
     y_list = []
 
+    # ========================================================
+    # 建立滑動視窗
+    # ========================================================
     for end_idx in range(
         lookback,
         len(clean) - horizon + 1
     ):
+
         start_idx = end_idx - lookback
 
+        # 過去 60 天
         x_list.append(
             feature_values[start_idx:end_idx]
         )
 
-        future_return = target_values[
+        # 未來 22 天 Close_Return
+        future_returns = target_values[
             end_idx:end_idx + horizon
         ]
 
         y_list.append(
-            future_return.reshape(-1)
+            future_returns.reshape(-1)
         )
 
-    X = np.asarray(x_list, dtype=np.float32)
-    y = np.asarray(y_list, dtype=np.float32)
+    X = np.asarray(
+        x_list,
+        dtype=np.float32
+    )
+
+    y = np.asarray(
+        y_list,
+        dtype=np.float32
+    )
 
     return (
         X,
@@ -1331,7 +1348,6 @@ def create_tcn_dataset(
         feature_scaler,
         target_scaler
     )
-
 
 def tcn_residual_block(
     x,
@@ -1380,8 +1396,11 @@ def build_tcn_model(
 ):
     """
     TCN：
-    60 天輸入 → 多層 causal dilated Conv1D → 22 天 OHLC。
+    60 天輸入
+    → 多層 causal dilated Conv1D
+    → 預測未來 22 天 Close 報酬率
     """
+
     inputs = tf.keras.Input(
         shape=(lookback, n_features)
     )
@@ -1393,8 +1412,9 @@ def build_tcn_model(
         activation="relu"
     )(inputs)
 
-    # Dilated convolution 讓模型能看到不同時間尺度
+    # Dilated convolution
     for dilation in [1, 2, 4, 8, 16]:
+
         x = tcn_residual_block(
             x,
             filters=64,
@@ -1404,13 +1424,28 @@ def build_tcn_model(
         )
 
     x = GlobalAveragePooling1D()(x)
-    x = Dense(128, activation="relu")(x)
-    x = Dropout(0.20)(x)
-    x = Dense(64, activation="relu")(x)
 
+    x = Dense(
+        128,
+        activation="relu"
+    )(x)
+
+    x = Dropout(0.20)(x)
+
+    x = Dense(
+        64,
+        activation="relu"
+    )(x)
+
+    # ========================================================
+    # 只預測 Close_Return
+    # horizon = 22
+    # TARGET_COLUMNS = 1
+    # 所以輸出 22 個數值
+    # ========================================================
     outputs = Dense(
-        horizon * 4,
-        name="future_returns"
+        horizon * len(TARGET_COLUMNS),
+        name="future_close_return"
     )(x)
 
     model = tf.keras.Model(
@@ -1489,43 +1524,6 @@ def make_latest_input(
     x = feature_scaler.transform(latest)
     return x.reshape(1, lookback, len(FEATURE_COLUMNS))
 
-
-def repair_ohlc(
-    ohlc: np.ndarray,
-    last_close: float
-) -> np.ndarray:
-    """修正 OHLC 邏輯，避免產生不合理 K 線。"""
-    fixed = np.asarray(ohlc, dtype=float).copy()
-
-    for i in range(len(fixed)):
-        open_p, high_p, low_p, close_p = fixed[i]
-
-        if i == 0:
-            open_p = 0.7 * last_close + 0.3 * open_p
-        else:
-            open_p = 0.7 * fixed[i - 1, 3] + 0.3 * open_p
-
-        body_high = max(open_p, close_p)
-        body_low = min(open_p, close_p)
-
-        high_p = max(high_p, body_high)
-        low_p = min(low_p, body_low)
-
-        open_p = max(open_p, 0.01)
-        high_p = max(high_p, 0.01)
-        low_p = max(low_p, 0.01)
-        close_p = max(close_p, 0.01)
-
-        fixed[i] = [
-            open_p,
-            high_p,
-            low_p,
-            close_p
-        ]
-
-    return fixed
-
-
 def predict_future_ohlc(
     model,
     clean_df: pd.DataFrame,
@@ -1535,52 +1533,198 @@ def predict_future_ohlc(
     horizon: int = FORECAST_DAYS
 ) -> pd.DataFrame:
 
+    # ========================================================
+    # 1. 建立最新 60 天輸入
+    # ========================================================
     x_latest = make_latest_input(
         clean_df,
         feature_scaler,
         lookback
     )
 
+    # ========================================================
+    # 2. TCN 預測未來 22 天 Close_Return
+    # ========================================================
     pred_scaled = model.predict(
         x_latest,
         verbose=0
     )[0]
 
     pred_scaled = pred_scaled.reshape(
-        horizon, 4
+        horizon,
+        len(TARGET_COLUMNS)
     )
 
-    # 還原成 OHLC 報酬率
     pred_returns = target_scaler.inverse_transform(
         pred_scaled
-    )
+    ).flatten()
 
-    # 每日報酬率限制在 -10% ~ +10%
+    # ========================================================
+    # 3. 第一層限制：報酬率不得超過 ±10%
+    # ========================================================
+    # ========================================================
+    # 根據最近 20 日實際波動率建立合理範圍
+    # ========================================================
+    recent_returns = (
+        clean_df["Close"]
+        .pct_change()
+        .dropna()
+        .tail(20)
+    )
+    
+    recent_volatility = float(
+        recent_returns.std()
+    )
+    
+    # 最多 ±10%，同時不超過最近波動率的 3 倍
+    adaptive_limit = min(
+        0.10,
+        recent_volatility * 3
+    )
+    
+    # 防止波動率過小造成幾乎不能動
+    adaptive_limit = max(
+        adaptive_limit,
+        0.01
+    )
+    
     pred_returns = np.clip(
         pred_returns,
-        -0.10,
-        0.10
+        -adaptive_limit,
+        adaptive_limit
     )
 
-    last_close = float(clean_df["Close"].iloc[-1])
+    # ========================================================
+    # 4. 取得最近實際 K 線資料
+    # ========================================================
+    recent = clean_df.tail(20).copy()
+
+    previous_close_series = recent["Close"].shift(1)
+
+    valid = previous_close_series.notna()
+
+    recent = recent.loc[valid].copy()
+    previous_close_series = previous_close_series.loc[valid]
+
+    # ========================================================
+    # 5. 計算最近 20 個交易日的 K 線型態
+    # ========================================================
+
+    # 開盤相對前一日收盤的跳空幅度
+    open_gap = (
+        recent["Open"] /
+        previous_close_series - 1
+    )
+
+    # 最高價相對於「開收盤較高者」的上影線比例
+    body_high = recent[
+        ["Open", "Close"]
+    ].max(axis=1)
+
+    high_range = (
+        recent["High"] /
+        body_high - 1
+    )
+
+    # 最低價相對於「開收盤較低者」的下影線比例
+    body_low = recent[
+        ["Open", "Close"]
+    ].min(axis=1)
+
+    low_range = (
+        1 -
+        recent["Low"] /
+        body_low
+    )
+
+    # ========================================================
+    # 6. 使用中位數避免極端值影響預測
+    # ========================================================
+
+    median_open_gap = float(
+        open_gap.clip(-0.10, 0.10).median()
+    )
+
+    median_high_range = float(
+        high_range.clip(0.0, 0.10).median()
+    )
+
+    median_low_range = float(
+        low_range.clip(0.0, 0.10).median()
+    )
+
+    # ========================================================
+    # 7. 逐日重建 OHLC
+    # ========================================================
+
+    last_close = float(
+        clean_df["Close"].iloc[-1]
+    )
+
+    forecast_rows = []
+
     previous_close = last_close
 
-    predicted_ohlc = []
+    for daily_return in pred_returns:
 
-    for i in range(horizon):
+        # ----------------------------------------------------
+        # 預測收盤
+        # ----------------------------------------------------
+        close_p = (
+            previous_close *
+            (1 + daily_return)
+        )
 
-        open_return = pred_returns[i, 0]
-        high_return = pred_returns[i, 1]
-        low_return = pred_returns[i, 2]
-        close_return = pred_returns[i, 3]
+        # ----------------------------------------------------
+        # 預測開盤
+        # 使用最近 20 日實際跳空幅度
+        # ----------------------------------------------------
+        open_p = (
+            previous_close *
+            (1 + median_open_gap)
+        )
 
-        # 由前一天收盤價還原今天價格
-        open_p = previous_close * (1 + open_return)
-        high_p = previous_close * (1 + high_return)
-        low_p = previous_close * (1 + low_return)
-        close_p = previous_close * (1 + close_return)
+        # ----------------------------------------------------
+        # 確保 Open 不會偏離 Close 太誇張
+        # ----------------------------------------------------
+        max_open_gap = 0.03
 
-        # 確保 K 線邏輯合理
+        open_p = np.clip(
+            open_p,
+            previous_close * (1 - max_open_gap),
+            previous_close * (1 + max_open_gap)
+        )
+
+        # ----------------------------------------------------
+        # 預測最高
+        # 根據最近實際 K 線影線比例
+        # ----------------------------------------------------
+        body_high = max(
+            open_p,
+            close_p
+        )
+
+        high_p = (
+            body_high *
+            (1 + median_high_range)
+        )
+
+        # ----------------------------------------------------
+        # 預測最低
+        # ----------------------------------------------------
+        body_low = min(
+            open_p,
+            close_p
+        )
+
+        low_p = (
+            body_low *
+            (1 - median_low_range)
+        )
+
+        # ----------------------------------------------------
+        # 最終 OHLC 邏輯檢查
+        # ----------------------------------------------------
         high_p = max(
             high_p,
             open_p,
@@ -1593,30 +1737,53 @@ def predict_future_ohlc(
             close_p
         )
 
-        predicted_ohlc.append([
+        # ----------------------------------------------------
+        # 避免價格 <= 0
+        # ----------------------------------------------------
+        open_p = max(open_p, 0.01)
+        high_p = max(high_p, 0.01)
+        low_p = max(low_p, 0.01)
+        close_p = max(close_p, 0.01)
+
+        forecast_rows.append([
             open_p,
             high_p,
             low_p,
-            close_p
+            close_p,
+            daily_return
         ])
 
-        # 下一天以今天預測收盤作為基準
+        # 下一天以前一天預測收盤為基準
         previous_close = close_p
 
+    # ========================================================
+    # 8. 建立未來交易日
+    # ========================================================
+
     future_dates = pd.bdate_range(
-        start=clean_df.index[-1] + pd.Timedelta(days=1),
+        start=clean_df.index[-1] +
+        pd.Timedelta(days=1),
         periods=horizon
     )
 
     forecast = pd.DataFrame(
-        predicted_ohlc,
+        forecast_rows,
         index=future_dates,
-        columns=["Open", "High", "Low", "Close"]
+        columns=[
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Return"
+        ]
     )
 
     forecast["Volume"] = 0.0
 
-    # 計算每日預測報酬率
+    # ========================================================
+    # 9. 最後再次確認 Close 日報酬率 ±10%
+    # ========================================================
+
     previous_closes = np.concatenate([
         [last_close],
         forecast["Close"].iloc[:-1].to_numpy()
@@ -1624,11 +1791,9 @@ def predict_future_ohlc(
 
     forecast["Return"] = (
         forecast["Close"].to_numpy()
-        / previous_closes
-        - 1
+        / previous_closes - 1
     )
 
-    # 再保險一次，限制每日報酬率
     forecast["Return"] = np.clip(
         forecast["Return"],
         -0.10,
@@ -1648,37 +1813,72 @@ def evaluate_tcn(
     target_scaler: MinMaxScaler,
     horizon: int = FORECAST_DAYS
 ):
+
     X_val, y_val = validation_data
 
+    # ========================================================
+    # 模型預測
+    # ========================================================
     pred = model.predict(
         X_val,
         verbose=0
     )
 
+    n_targets = len(TARGET_COLUMNS)
+
+    # ========================================================
+    # 還原成：
+    # [樣本數, 22 天, target數量]
+    # ========================================================
     pred = pred.reshape(
-        -1, horizon, 4
+        -1,
+        horizon,
+        n_targets
     )
+
     actual = y_val.reshape(
-        -1, horizon, 4
+        -1,
+        horizon,
+        n_targets
     )
 
-    pred_flat = pred.reshape(-1, 4)
-    actual_flat = actual.reshape(-1, 4)
+    # ========================================================
+    # 攤平成：
+    # [樣本數 × 22, target數量]
+    # ========================================================
+    pred_flat = pred.reshape(
+        -1,
+        n_targets
+    )
 
+    actual_flat = actual.reshape(
+        -1,
+        n_targets
+    )
+
+    # ========================================================
+    # 還原原始報酬率
+    # ========================================================
     pred_real = target_scaler.inverse_transform(
         pred_flat
     )
+
     actual_real = target_scaler.inverse_transform(
         actual_flat
     )
 
     metrics = {}
 
+    # ========================================================
+    # 計算 MAE / RMSE
+    # ========================================================
     for i, name in enumerate(TARGET_COLUMNS):
+
         mae = mean_absolute_error(
             actual_real[:, i],
             pred_real[:, i]
         )
+
         rmse = np.sqrt(
             mean_squared_error(
                 actual_real[:, i],
@@ -1692,7 +1892,6 @@ def evaluate_tcn(
         }
 
     return metrics
-
 
 # ============================================================
 # 9. K 線圖
@@ -2171,6 +2370,26 @@ with tab4:
             
             historical = stock_df[["Open", "High", "Low", "Close", "Volume"]].tail(hist_days).copy()
 
+            all_trading_dates = historical.index.union(
+                forecast_df.index
+            )
+            
+            dt_all = pd.date_range(
+                start=all_trading_dates.min(),
+                end=all_trading_dates.max(),
+                freq="D"
+            )
+            
+            dt_breaks = list(
+                set(
+                    dt_all.strftime("%Y-%m-%d")
+                )
+                -
+                set(
+                    all_trading_dates.strftime("%Y-%m-%d")
+                )
+            )
+            
             display_forecast = forecast_df.head(forecast_days)
             
             # 合併歷史與預測的所有交易日期
@@ -2182,15 +2401,117 @@ with tab4:
             dt_breaks = list(set(dt_all.strftime("%Y-%m-%d")) - set(all_trading_dates.strftime("%Y-%m-%d")))
 
             fig_ai = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.72, 0.28], row_titles=["價格"])
-            fig_ai.add_trace(go.Candlestick(x=historical.index, open=historical["Open"], high=historical["High"], low=historical["Low"], close=historical["Close"], name="歷史 K 線", increasing_line_color="red", increasing_fillcolor="red", decreasing_line_color="green", decreasing_fillcolor="green"), row=1, col=1)
-            # fig_ai.add_trace(go.Bar(x=historical.index, y=historical["Volume"], name="歷史成交量", marker_color=["red" if c >= o else "green" for c, o in zip(historical["Close"], historical["Open"])], opacity=0.65), row=2, col=1)
+            color_c1, color_c2 = st.columns(2)
+
+            with color_c1:
+                up_color = st.color_picker(
+                    "上漲 K 線顏色",
+                    "#0000FF",
+                    key="ai_up_color"
+                )
+            
+            with color_c2:
+                down_color = st.color_picker(
+                    "下跌 K 線顏色",
+                    "#FFA500",
+                    key="ai_down_color"
+                )
+            fig_ai.add_trace(
+                go.Candlestick(
+                    x=historical.index,
+                    open=historical["Open"],
+                    high=historical["High"],
+                    low=historical["Low"],
+                    close=historical["Close"],
+                    name="歷史 K 線",
+            
+                    increasing_line_color=up_color,
+                    increasing_fillcolor=up_color,
+            
+                    decreasing_line_color=down_color,
+                    decreasing_fillcolor=down_color
+                ),
+                row=1,
+                col=1
+            )           
+            fig_ai = go.Figure()
             # 以 Scatter + Bar 手動畫出 Version 5 的藍漲 / 橘跌預測 K 線
-            for i, (dt, row) in enumerate(display_forecast.iterrows()):
-                color = "blue" if row["Close"] >= row["Open"] else "orange"
-                fig_ai.add_trace(go.Scatter(x=[dt, dt], y=[row["Low"], row["High"]], mode="lines", line=dict(color=color, width=2), showlegend=False, hoverinfo="skip"), row=1, col=1)
-                fig_ai.add_trace(go.Bar(x=[dt], y=[row["Close"] - row["Open"]], base=[min(row["Open"], row["Close"])], width=0.55 * 24 * 60 * 60 * 1000, marker_color=color, name="AI 預測" if i == 0 else None, showlegend=(i == 0), hovertemplate=f"日期: {dt.strftime('%Y-%m-%d')}<br>開盤: {row['Open']:.2f}<br>最高: {row['High']:.2f}<br>最低: {row['Low']:.2f}<br>收盤: {row['Close']:.2f}<br>預測報酬: {row['Return'] * 100:+.2f}%<extra></extra>"), row=1, col=1)
+            for i, (dt, row) in enumerate(forecast_df.iterrows()):
+                color = (
+                    up_color
+                    if row["Close"] >= row["Open"]
+                    else down_color
+                )
+            
+                # 上下影線
+                fig_ai.add_trace(
+                    go.Scatter(
+                        x=[dt, dt],
+                        y=[row["Low"], row["High"]],
+                        mode="lines",
+                        line=dict(
+                            color=color,
+                            width=2
+                        ),
+                        showlegend=False,
+                        hoverinfo="skip"
+                    )
+                )
+            
+                # K 線實體
+                fig_ai.add_trace(
+                    go.Bar(
+                        x=[dt],
+                        y=[row["Close"] - row["Open"]],
+                        base=[
+                            min(
+                                row["Open"],
+                                row["Close"]
+                            )
+                        ],
+                        width=0.55 * 24 * 60 * 60 * 1000,
+                        marker_color=color,
+                        name="AI 預測" if i == 0 else None,
+                        showlegend=(i == 0),
+            
+                        hovertemplate=(
+                            f"日期: {dt.strftime('%Y-%m-%d')}"
+                            f"<br>開盤: {row['Open']:.2f}"
+                            f"<br>最高: {row['High']:.2f}"
+                            f"<br>最低: {row['Low']:.2f}"
+                            f"<br>收盤: {row['Close']:.2f}"
+                            f"<br>預測報酬: "
+                            f"{row['Return'] * 100:+.2f}%"
+                            f"<extra></extra>"
+                        )
+                    )
+                )
             fig_ai.add_vline(x=display_forecast.index[0], line_dash="dash", line_color="gray", row=1, col=1)
-            fig_ai.update_layout(title=f"{result['target']} 歷史 K 線與 AI 預測 | KMeans：{latest_state}", height=680, template="plotly_white", hovermode="x unified", xaxis_rangeslider_visible=False, xaxis=dict(rangebreaks=[dict(values=dt_breaks)]))
+            fig_ai.update_layout(
+                title=(
+                    f"{result['target']} 歷史 K 線與 AI 預測"
+                    f" | KMeans：{latest_state}"
+                ),
+                height=600,
+                template="plotly_white",
+                hovermode="x unified",
+                xaxis_rangeslider_visible=False,
+            
+                xaxis=dict(
+                    rangebreaks=[
+                        dict(values=dt_breaks)
+                    ]
+                )
+            )
+            
+            fig_ai.update_yaxes(
+                title_text="價格"
+            )
+            
+            st.plotly_chart(
+                fig_ai,
+                use_container_width=True
+            )
             fig_ai.update_yaxes(title_text="價格", row=1, col=1)
             fig_ai.update_yaxes(title_text="成交量", row=2, col=1)
             st.plotly_chart(fig_ai, use_container_width=True)
