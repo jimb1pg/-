@@ -2270,10 +2270,11 @@ with tab4:
                     low=historical["Low"],
                     close=historical["Close"],
                     name="歷史 K 線",
-                    increasing_line_color=up_color,
-                    increasing_fillcolor=up_color,
-                    decreasing_line_color=down_color,
-                    decreasing_fillcolor=down_color
+                    # 歷史 K 線固定：紅漲、綠跌
+                    increasing_line_color="#FF0000",
+                    increasing_fillcolor="#FF0000",
+                    decreasing_line_color="#00AA00",
+                    decreasing_fillcolor="#00AA00"
                 ),
                 row=1,
                 col=1
