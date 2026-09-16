@@ -164,7 +164,7 @@ with tab1:
                                 fetch_success = True
                 else:
                     fm_id = etf_option.replace(".TW", "")
-                    fm_df = fm_api.taiwan_stock_daily_adj(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
+                    fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
                     if not fm_df.empty:
                         fm_df = fm_df.rename(columns={'date': 'Date', 'open': 'Open', 'max': 'High', 'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'})
                         fm_df['Date'] = pd.to_datetime(fm_df['Date'])
@@ -411,14 +411,14 @@ with tab2:
                     if (bt_data.empty or len(bt_data) <= 1) and t2_target.endswith(".TW"):
                         actual_t2_source = "FinMind (備援)"
                         fm_id = t2_target.replace(".TW", "")
-                        bt_df = fm_api.taiwan_stock_daily_adj(stock_id=fm_id, start_date=start_date_str, end_date=end_date_str)
+                        bt_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=start_date_str, end_date=end_date_str)
                         if not bt_df.empty:
                             bt_df = bt_df.rename(columns={'date': 'Date', 'close': 'Close'})
                             bt_df['Date'] = pd.to_datetime(bt_df['Date'])
                             bt_data = bt_df.set_index('Date')
                 else:
                     fm_id = t2_target.replace(".TW", "")
-                    bt_df = fm_api.taiwan_stock_daily_adj(stock_id=fm_id, start_date=start_date_str, end_date=end_date_str)
+                    bt_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=start_date_str, end_date=end_date_str)
                     if not bt_df.empty:
                         bt_df = bt_df.rename(columns={'date': 'Date', 'close': 'Close'})
                         bt_df['Date'] = pd.to_datetime(bt_df['Date'])
@@ -549,7 +549,7 @@ with tab3:
                 
                 if use_fm:
                     fm_id = ticker.replace(".TW", "").replace(".TWO", "")
-                    fm_df = fm_api.taiwan_stock_daily_adj(stock_id=fm_id, start_date=fetch_start_date, end_date=end_date_str)
+                    fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date, end_date=end_date_str)
                     if not fm_df.empty and len(fm_df) > 15:
                         fm_df = fm_df.rename(columns={'date': 'Date', 'close': 'Close'})
                         fm_df['Date'] = pd.to_datetime(fm_df['Date'])
@@ -665,7 +665,7 @@ def normalize_finmind_columns(df: pd.DataFrame) -> pd.DataFrame:
 def get_finmind_data(stock_id: str, years: int = 5) -> pd.DataFrame:
     start_date, end_date = get_date_range(years)
 
-    df = api.taiwan_stock_daily_adj(
+    df = api.taiwan_stock_daily(
         stock_id=stock_id,
         start_date=start_date,
         end_date=end_date
