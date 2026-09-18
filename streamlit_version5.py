@@ -1525,15 +1525,6 @@ def predict_future_ohlc(
         pred_scaled
     ).flatten()
 
-    # 
-    print("\n========== TCN 原始預測 ==========")
-    print("原始 pred_returns：")
-    print(np.round(pred_returns * 100, 4))
-    
-    print( f"最近20日波動率：{recent_volatility * 100:.4f}%")
-    
-    print( f"adaptive_limit：{adaptive_limit * 100:.4f}%")
-    
     # ========================================================
     # 3. 報酬率限制：最多 ±10%，並參考最近 20 日波動
     # ========================================================
@@ -1563,10 +1554,6 @@ def predict_future_ohlc(
         -adaptive_limit,
         adaptive_limit
     )
-
-    #
-    print("\n========== Clip 後預測 ==========")
-    print(np.round(pred_returns * 100, 4))
 
     # ========================================================
     # 4. 取得最近 20 個交易日的實際 K 線型態
