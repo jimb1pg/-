@@ -29,6 +29,7 @@ from transformers import pipeline
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+import exchange_calendars as xcals
 import tensorflow as tf
 from tensorflow.keras.layers import Conv1D, Dense, Dropout, BatchNormalization, GlobalAveragePooling1D, Add
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
@@ -1256,11 +1257,199 @@ FEATURE_COLUMNS = [
     "Volatility20",
     "ATR14",
     "Volume_Change",
-    "sentiment_score"
+    "sentiment_score",
+    # KMeans regime features（以訓練期間建立，避免未來資訊洩漏）
+    "KMeans_TrendScore",
+    "KMeans_Volatility"
 ]
 
 # TCN 只預測收盤價報酬率
 TARGET_COLUMNS = ["Close_Return"]
+
+
+def add_kmeans_tcn_features(
+    df: pd.DataFrame,
+    train_ratio: float = TRAIN_RATIO,
+    n_clusters: int = KMEANS_CLUSTERS
+) -> pd.DataFrame:
+    """
+    建立供 TCN 使用的 KMeans 市場狀態特徵。
+
+    與畫面上的 get_market_state() 不同，這裡的 KMeans 僅使用
+    訓練期間資料 fit，再將模型套用到整段歷史資料，避免 validation
+    / future information 參與分群模型的訓練。
+
+    輸出：
+    - KMeans_TrendScore：該市場狀態的平均趨勢分數
+    - KMeans_Volatility：該市場狀態的平均 20 日波動度
+    """
+    result = df.copy()
+
+    km = build_kmeans_features(result)
+    if len(km) < 100:
+        raise ValueError("KMeans TCN 特徵資料不足，建議使用至少 1 年以上資料。")
+
+    train_end = max(
+        50,
+        min(
+            len(km),
+            int(len(km) * train_ratio)
+        )
+    )
+
+    train_km = km.iloc[:train_end].copy()
+
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train_km)
+
+    model = KMeans(
+        n_clusters=n_clusters,
+        random_state=RANDOM_SEED,
+        n_init=20
+    )
+    model.fit(train_scaled)
+
+    all_scaled = scaler.transform(km)
+    all_labels = model.predict(all_scaled)
+
+    train_labels = model.labels_
+    train_with_cluster = train_km.copy()
+    train_with_cluster["Cluster"] = train_labels
+
+    centers = train_with_cluster.groupby("Cluster").agg(
+        Trend20=("Trend20", "mean"),
+        Trend60=("Trend60", "mean"),
+        Volatility20=("Volatility20", "mean")
+    )
+    centers["TrendScore"] = centers["Trend20"] + centers["Trend60"]
+
+    label_series = pd.Series(
+        all_labels,
+        index=km.index
+    )
+
+    result["KMeans_TrendScore"] = (
+        label_series.map(centers["TrendScore"])
+    )
+    result["KMeans_Volatility"] = (
+        label_series.map(centers["Volatility20"])
+    )
+
+    # 尚未形成 20/60 日 KMeans 特徵的日期保持 NaN，之後由 TCN dataset dropna。
+    return result
+
+
+def get_regime_ohlc_profile(
+    clean_df: pd.DataFrame,
+    latest_cluster: int | None = None
+) -> dict:
+    """
+    根據目前 KMeans 市場狀態，從歷史同一 regime 的 K 線型態建立
+    未來 OHLC 重建模板。
+
+    不讓「上升型」直接等於未來一定上漲，而是只用來決定：
+    - 合理日內波動範圍
+    - Open gap
+    - 上影線比例
+    - 下影線比例
+    - K 線實體比例
+    """
+    data = clean_df.copy()
+
+    if latest_cluster is not None and "Market_Cluster" in data.columns:
+        regime_data = data[
+            data["Market_Cluster"] == latest_cluster
+        ].copy()
+    else:
+        regime_data = pd.DataFrame()
+
+    # 同一 regime 樣本太少時，退回最近 60 個交易日。
+    if len(regime_data) < 20:
+        regime_data = data.tail(60).copy()
+
+    previous_close = regime_data["Close"].shift(1)
+    valid = previous_close.notna()
+    regime_data = regime_data.loc[valid].copy()
+    previous_close = previous_close.loc[valid]
+
+    if regime_data.empty:
+        return {
+            "return_q10": -0.02,
+            "return_q90": 0.02,
+            "open_gap_median": 0.0,
+            "body_ratio_median": 0.008,
+            "upper_wick_median": 0.004,
+            "lower_wick_median": 0.004,
+            "volatility": 0.01,
+            "sample_count": 0,
+        }
+
+    returns = (
+        regime_data["Close"] / previous_close - 1
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+
+    open_gap = (
+        regime_data["Open"] / previous_close - 1
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+
+    body_high = regime_data[["Open", "Close"]].max(axis=1)
+    body_low = regime_data[["Open", "Close"]].min(axis=1)
+
+    body_ratio = (
+        (regime_data["Close"] - regime_data["Open"]).abs()
+        / regime_data["Close"].replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+
+    upper_wick = (
+        (regime_data["High"] - body_high)
+        / regime_data["Close"].replace(0, np.nan)
+    ).clip(lower=0).replace([np.inf, -np.inf], np.nan).dropna()
+
+    lower_wick = (
+        (body_low - regime_data["Low"])
+        / regime_data["Close"].replace(0, np.nan)
+    ).clip(lower=0).replace([np.inf, -np.inf], np.nan).dropna()
+
+    volatility = float(returns.std()) if len(returns) > 1 else 0.01
+
+    # 直接使用同 regime 歷史報酬的 10/90 分位數，避免 ETF 被套用過大的通用 ±10%。
+    q10 = float(returns.quantile(0.10)) if len(returns) >= 10 else -max(volatility * 2, 0.005)
+    q90 = float(returns.quantile(0.90)) if len(returns) >= 10 else max(volatility * 2, 0.005)
+
+    # 保留合理範圍，同時避免 0050 這種 ETF 出現連續過大的 K 棒。
+    q10 = float(np.clip(q10, -0.06, -0.003))
+    q90 = float(np.clip(q90, 0.003, 0.06))
+
+    return {
+        "return_q10": q10,
+        "return_q90": q90,
+        "open_gap_median": float(open_gap.clip(-0.02, 0.02).median()),
+        "body_ratio_median": float(body_ratio.clip(0, 0.04).median()),
+        "upper_wick_median": float(upper_wick.clip(0, 0.03).median()),
+        "lower_wick_median": float(lower_wick.clip(0, 0.03).median()),
+        "volatility": volatility,
+        "sample_count": int(len(regime_data)),
+    }
+
+
+def get_taiwan_trading_dates(
+    last_date: pd.Timestamp,
+    periods: int
+) -> pd.DatetimeIndex:
+    """使用台灣證券交易所交易日曆產生未來實際交易日。"""
+    calendar = xcals.get_calendar("XTAI")
+
+    start = pd.Timestamp(last_date).tz_localize(None) + pd.Timedelta(days=1)
+    end = start + pd.Timedelta(days=max(periods * 2, periods + 15))
+
+    sessions = calendar.sessions_in_range(
+        start.normalize(),
+        end.normalize()
+    )
+    sessions = pd.DatetimeIndex(sessions).tz_localize(None)
+
+    sessions = sessions[sessions > pd.Timestamp(last_date).normalize()]
+    return sessions[:periods]
 
 
 def create_tcn_dataset(
@@ -1551,13 +1740,17 @@ def predict_future_ohlc(
     feature_scaler: MinMaxScaler,
     target_scaler: MinMaxScaler,
     lookback: int = LOOKBACK_DAYS,
-    horizon: int = FORECAST_DAYS
+    horizon: int = FORECAST_DAYS,
+    latest_cluster: int | None = None
 ) -> pd.DataFrame:
     """
-    TCN 只預測未來 Close_Return，再依照最近實際 K 線型態重建 OHLC。
+    TCN 預測未來 Close Return，再依「目前 KMeans regime 的歷史 K 線型態」
+    重建 OHLC。
 
-    目的：避免模型同時獨立預測 Open / High / Low / Close，
-    造成不合理的大型上下影線。
+    注意：
+    - KMeans 不直接決定漲跌方向。
+    - KMeans 只提供與目前市場狀態相符的波動 / K 線型態模板。
+    - Close 仍由 TCN 預測報酬率決定。
     """
 
     # ========================================================
@@ -1570,7 +1763,7 @@ def predict_future_ohlc(
     )
 
     # ========================================================
-    # 2. TCN 預測未來 22 天 Close_Return
+    # 2. TCN 預測未來 Close_Return
     # ========================================================
     pred_scaled = model.predict(
         x_latest,
@@ -1587,37 +1780,35 @@ def predict_future_ohlc(
     ).flatten()
 
     # ========================================================
-    # 3. 報酬率限制：最多 ±10%，並參考最近 20 日波動
+    # 3. 取得目前 KMeans regime 的歷史 K 線模板
     # ========================================================
-    recent_returns = (
-        clean_df["Close"]
-        .pct_change()
-        .dropna()
-        .tail(20)
+    profile = get_regime_ohlc_profile(
+        clean_df,
+        latest_cluster=latest_cluster
     )
 
-    recent_volatility = float(
-        recent_returns.std()
-    ) if len(recent_returns) > 1 else 0.01
-
-    # 依近期波動度設定合理範圍。
-    # 注意：這裡不能直接 np.clip，否則模型一旦預測超過上限，
-    # 連續多天會全部被壓成完全相同的報酬率（例如 -3.31%），
-    # K 線就會出現不自然的「連續等幅下跌」。
-    adaptive_limit = np.clip(
-        recent_volatility * 3,
-        0.01,
-        MAX_DAILY_RETURN
+    q10 = profile["return_q10"]
+    q90 = profile["return_q90"]
+    regime_volatility = max(
+        float(profile["volatility"]),
+        0.002
     )
 
-    # 使用平滑壓縮，而不是硬切斷。
-    # 大於合理範圍的預測仍會保留彼此之間的差異。
+    # 使用平滑壓縮，不再讓所有超界預測變成同一個數字。
+    # 這次上下界直接來自目前 KMeans regime 的歷史報酬分布。
+    center = (q10 + q90) / 2.0
+    half_range = max((q90 - q10) / 2.0, 0.003)
+
     pred_returns = (
-        adaptive_limit
-        * np.tanh(pred_returns / adaptive_limit)
+        center
+        + half_range
+        * np.tanh(
+            (pred_returns - center)
+            / max(regime_volatility, 0.003)
+        )
     )
 
-    # 避免模型產生完全不合理的極端值。
+    # 最後只做非常寬鬆的安全邊界，避免模型輸出極端值。
     pred_returns = np.clip(
         pred_returns,
         -MAX_DAILY_RETURN,
@@ -1625,104 +1816,88 @@ def predict_future_ohlc(
     )
 
     # ========================================================
-    # 4. 取得最近 20 個交易日的實際 K 線型態
+    # 4. 使用「目前 KMeans 狀態」的歷史 K 線型態
     # ========================================================
-    recent = clean_df.tail(20).copy()
-    previous_close_series = recent["Close"].shift(1)
-    valid = previous_close_series.notna()
-
-    recent = recent.loc[valid].copy()
-    previous_close_series = previous_close_series.loc[valid]
-
-    # 開盤相對前一日收盤的跳空比例
-    open_gap = (
-        recent["Open"] / previous_close_series - 1
-    )
-
-    # 實體最高點以上的平均/中位影線比例
-    body_high = recent[["Open", "Close"]].max(axis=1)
-    high_range = recent["High"] / body_high - 1
-
-    # 實體最低點以下的平均/中位影線比例
-    body_low = recent[["Open", "Close"]].min(axis=1)
-    low_range = 1 - recent["Low"] / body_low
-
-    # 使用中位數，降低單一極端交易日影響
-    median_open_gap = float(
-        open_gap.clip(-0.03, 0.03).median()
-    )
-    median_high_range = float(
-        high_range.clip(0.0, 0.05).median()
-    )
-    median_low_range = float(
-        low_range.clip(0.0, 0.05).median()
-    )
+    median_open_gap = profile["open_gap_median"]
+    median_body_ratio = profile["body_ratio_median"]
+    median_high_range = profile["upper_wick_median"]
+    median_low_range = profile["lower_wick_median"]
 
     # ========================================================
     # 5. 逐日重建 OHLC
     # ========================================================
-    last_close = float(
-        clean_df["Close"].iloc[-1]
-    )
-
-    forecast_rows = []
+    last_close = float(clean_df["Close"].iloc[-1])
     previous_close = last_close
+    forecast_rows = []
 
     for daily_return in pred_returns:
-        # 收盤價由 TCN 預測報酬率決定
         close_p = previous_close * (1 + daily_return)
 
-        # 開盤不要每天固定使用完全相同的跳空。
-        # 以「預測方向 + 歷史平均 gap」共同決定，
-        # 讓 K 線型態比原本自然。
+        # Open：以目前 regime 歷史 gap 為主，加入少量預測方向資訊。
         predicted_gap = (
-            median_open_gap * 0.5
-            + daily_return * 0.15
+            median_open_gap * 0.70
+            + daily_return * 0.10
+        )
+        predicted_gap = float(
+            np.clip(predicted_gap, -0.015, 0.015)
         )
 
         open_p = previous_close * (1 + predicted_gap)
 
-        # 避免開盤相對前收過度偏離
-        open_p = np.clip(
-            open_p,
-            previous_close * 0.98,
-            previous_close * 1.02
+        # 如果歷史 regime 的實體比例很小，K 棒就不應突然變成巨大實體。
+        # 但 Close 仍必須維持 TCN 的預測，因此這裡只用 body ratio
+        # 作為 OHLC 型態檢查，不修改 Close。
+        body_distance = abs(close_p - open_p)
+        expected_body_distance = previous_close * median_body_ratio
+
+        # 若 Open 與 Close 距離遠超同 regime 歷史型態，
+        # 只將 Open 拉近 Close；不改動 TCN 預測 Close。
+        max_body_distance = max(
+            expected_body_distance * 2.5,
+            previous_close * 0.002
         )
 
-        # High / Low 依照最近實際 K 線影線比例重建
+        if body_distance > max_body_distance:
+            if close_p >= open_p:
+                open_p = close_p - max_body_distance
+            else:
+                open_p = close_p + max_body_distance
+
         body_high = max(open_p, close_p)
         body_low = min(open_p, close_p)
 
         high_p = body_high * (1 + median_high_range)
         low_p = body_low * (1 - median_low_range)
 
-        # OHLC 邏輯檢查
+        # OHLC 邏輯保證：High >= max(Open, Close)，Low <= min(Open, Close)
         high_p = max(high_p, open_p, close_p)
         low_p = min(low_p, open_p, close_p)
 
-        open_p = max(open_p, 0.01)
-        high_p = max(high_p, 0.01)
-        low_p = max(low_p, 0.01)
-        close_p = max(close_p, 0.01)
+        open_p = max(float(open_p), 0.01)
+        high_p = max(float(high_p), 0.01)
+        low_p = max(float(low_p), 0.01)
+        close_p = max(float(close_p), 0.01)
 
         forecast_rows.append([
             open_p,
             high_p,
             low_p,
             close_p,
-            daily_return
+            float(daily_return)
         ])
 
-        # 下一天以前一天預測收盤為基準
         previous_close = close_p
 
     # ========================================================
-    # 6. 建立未來交易日
+    # 6. 台股實際交易日，不再單純使用 Mon-Fri
     # ========================================================
-    future_dates = pd.bdate_range(
-        start=clean_df.index[-1] + pd.Timedelta(days=1),
-        periods=horizon
+    future_dates = get_taiwan_trading_dates(
+        clean_df.index[-1],
+        horizon
     )
+
+    if len(future_dates) < horizon:
+        raise ValueError("無法建立完整的台股未來交易日。")
 
     forecast = pd.DataFrame(
         forecast_rows,
@@ -1738,16 +1913,16 @@ def predict_future_ohlc(
 
     forecast["Volume"] = 0.0
 
-    # 最後重新依照連續 Close 計算每日報酬率。
-    # 不再對 Return 做第二次硬 clip，避免畫面上的報酬率
-    # 與實際預測 Close 不一致。
+    # 最後依連續 Close 再計算一次 Return，確保表格與 K 線完全一致。
     previous_closes = np.concatenate([
         [last_close],
         forecast["Close"].iloc[:-1].to_numpy()
     ])
 
     forecast["Return"] = (
-        forecast["Close"].to_numpy() / previous_closes - 1
+        forecast["Close"].to_numpy()
+        / previous_closes
+        - 1
     )
 
     return forecast
@@ -2105,7 +2280,21 @@ def run_prediction(
         latest_cluster = -1
         latest_state = "未知"
 
-    # 5. 建立 TCN Dataset
+    # 5. 建立 KMeans regime-aware TCN 特徵
+    try:
+        feature_df = add_kmeans_tcn_features(
+            feature_df,
+            train_ratio=TRAIN_RATIO,
+            n_clusters=KMEANS_CLUSTERS
+        )
+    except Exception as e:
+        print(f"⚠️ 建立 KMeans TCN 特徵失敗：{e}")
+        feature_df["KMeans_TrendScore"] = 0.0
+        feature_df["KMeans_Volatility"] = (
+            feature_df["Volatility20"].fillna(0.0)
+        )
+
+    # 6. 建立 TCN Dataset
     try:
         (
             X_train,
@@ -2168,7 +2357,8 @@ def run_prediction(
             feature_scaler,
             target_scaler,
             lookback=LOOKBACK_DAYS,
-            horizon=FORECAST_DAYS
+            horizon=FORECAST_DAYS,
+            latest_cluster=latest_cluster
         )
 
     except Exception as e:
@@ -2199,7 +2389,7 @@ def run_prediction(
 with tab4:
     with st.container(border=True):
         st.subheader("🤖 AI 多模態月度預測")
-        st.caption("整合 Version 5：KMeans 市場狀態 + FinBERT 新聞情緒 + TCN 多步 Close 報酬率預測")
+        st.caption("整合 Version 5：KMeans 市場狀態 + FinBERT 新聞情緒 + Regime-aware TCN Close 報酬率預測；未來 OHLC 依目前 KMeans 狀態的歷史 K 線型態重建")
 
         ai_c1, ai_c2, ai_c3 = st.columns([1.5, 1.2, 1.3])
         with ai_c1:
@@ -2234,6 +2424,15 @@ with tab4:
                 (cluster_series, state_series, latest_cluster, latest_state, cluster_summary, _, _) = get_market_state(feature_df)
                 feature_df["Market_Cluster"] = cluster_series.reindex(feature_df.index)
                 feature_df["Market_State"] = state_series.reindex(feature_df.index)
+
+                # KMeans regime-aware TCN 特徵：只用訓練期間 fit KMeans，
+                # 再套用到完整歷史資料，避免 validation leakage。
+                feature_df = add_kmeans_tcn_features(
+                    feature_df,
+                    train_ratio=TRAIN_RATIO,
+                    n_clusters=KMEANS_CLUSTERS
+                )
+
                 (
                     X_train, y_train, X_val, y_val,
                     clean_df, feature_scaler, target_scaler
@@ -2252,7 +2451,15 @@ with tab4:
                     model, validation_data, target_scaler,
                     horizon=FORECAST_DAYS
                 )
-                forecast_df = predict_future_ohlc(model, clean_df, feature_scaler, target_scaler, lookback=LOOKBACK_DAYS, horizon=FORECAST_DAYS)
+                forecast_df = predict_future_ohlc(
+                    model,
+                    clean_df,
+                    feature_scaler,
+                    target_scaler,
+                    lookback=LOOKBACK_DAYS,
+                    horizon=FORECAST_DAYS,
+                    latest_cluster=latest_cluster
+                )
                 st.session_state["ai_result"] = {
                     "stock_df": stock_df, "feature_df": feature_df, "clean_df": clean_df,
                     "sentiment_df": sentiment_df, "latest_state": latest_state, "latest_cluster": latest_cluster,
