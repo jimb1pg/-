@@ -156,7 +156,7 @@ with tab1:
                         if etf_option.endswith(".TW"):
                             actual_source = "FinMind (備援)"
                             fm_id = etf_option.replace(".TW", "")
-                            fm_df = fm_api.taiwan_stock_daily_adj(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
+                            fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
                             if not fm_df.empty:
                                 fm_df = fm_df.rename(columns={'date': 'Date', 'open': 'Open', 'max': 'High', 'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'})
                                 fm_df['Date'] = pd.to_datetime(fm_df['Date'])
@@ -164,7 +164,7 @@ with tab1:
                                 fetch_success = True
                 else:
                     fm_id = etf_option.replace(".TW", "")
-                    fm_df = fm_api.taiwan_stock_daily_adj(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
+                    fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
                     if not fm_df.empty:
                         fm_df = fm_df.rename(columns={'date': 'Date', 'open': 'Open', 'max': 'High', 'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'})
                         fm_df['Date'] = pd.to_datetime(fm_df['Date'])
@@ -549,7 +549,7 @@ with tab3:
                 
                 if use_fm:
                     fm_id = ticker.replace(".TW", "").replace(".TWO", "")
-                    fm_df = fm_api.taiwan_stock_daily_adj(stock_id=fm_id, start_date=fetch_start_date, end_date=end_date_str)
+                    fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date, end_date=end_date_str)
                     if not fm_df.empty and len(fm_df) > 15:
                         fm_df = fm_df.rename(columns={'date': 'Date', 'close': 'Close'})
                         fm_df['Date'] = pd.to_datetime(fm_df['Date'])
@@ -685,7 +685,7 @@ def get_yfinance_data(stock_id: str, years: int = 5) -> pd.DataFrame:
         ticker,
         start=start_date,
         end=end_date,
-        auto_adjust=True,
+        auto_adjust=False,
         progress=False
     )
 
@@ -2156,12 +2156,12 @@ with tab4:
         with ai_c3:
             ai_years = st.selectbox("模型歷史資料：", [3, 5, 7, 10], index=1, format_func=lambda x: f"近 {x} 年", key="ai_years")
 
-        # st.markdown("**🧠 Version 5 模型設定**")
-        # model_c1, model_c2, model_c3, model_c4 = st.columns(4)
-        # with model_c1: st.metric("輸入窗口", f"{LOOKBACK_DAYS} 交易日")
-        # with model_c2: st.metric("預測區間", f"{FORECAST_DAYS} 交易日")
-        # with model_c3: st.metric("KMeans", f"{KMEANS_CLUSTERS} 狀態")
-        # with model_c4: st.metric("預測目標", "Close 報酬率")
+        st.markdown("**🧠 Version 5 模型設定**")
+        model_c1, model_c2, model_c3, model_c4 = st.columns(4)
+        with model_c1: st.metric("輸入窗口", f"{LOOKBACK_DAYS} 交易日")
+        with model_c2: st.metric("預測區間", f"{FORECAST_DAYS} 交易日")
+        with model_c3: st.metric("KMeans", f"{KMEANS_CLUSTERS} 狀態")
+        with model_c4: st.metric("預測目標", "Close 報酬率")
 
         ai_button = st.button("🚀 執行 Version 5 AI 預測", use_container_width=True, key="ai_btn")
 
@@ -2270,11 +2270,10 @@ with tab4:
                     low=historical["Low"],
                     close=historical["Close"],
                     name="歷史 K 線",
-                    # 歷史 K 線固定：紅漲、綠跌
-                    increasing_line_color="#FF0000",
-                    increasing_fillcolor="#FF0000",
-                    decreasing_line_color="#00AA00",
-                    decreasing_fillcolor="#00AA00"
+                    increasing_line_color=up_color,
+                    increasing_fillcolor=up_color,
+                    decreasing_line_color=down_color,
+                    decreasing_fillcolor=down_color
                 ),
                 row=1,
                 col=1
@@ -2422,10 +2421,10 @@ with tab4:
             )
 
         state_c1, state_c2 = st.columns([1, 1.6])
-        # with state_c1:
-        #   with st.container(border=True):
-        #        st.subheader("🧭 KMeans 市場型態")
-        #        st.metric("目前市場型態", f"{state_icon} {latest_state}")
+        with state_c1:
+            with st.container(border=True):
+                st.subheader("🧭 KMeans 市場型態")
+                st.metric("目前市場型態", f"{state_icon} {latest_state}")
         with state_c2:
             with st.container(border=True):
                 st.subheader("📰 FinBERT 新聞情緒")
