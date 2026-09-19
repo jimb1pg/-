@@ -2376,7 +2376,12 @@ with tab4:
                 fig_ai.add_trace(
                     go.Bar(
                         x=[dt],
-                        y=[row["Close"] - row["Open"]],
+                        # K 線實體高度必須使用絕對值。
+                        # 原本直接使用 Close - Open，當 Close < Open 時
+                        # y 會是負值，再搭配 base=min(Open, Close)，
+                        # Plotly 會把柱體往錯誤方向繪製，造成 0050 這類
+                        # 下跌 K 線看起來沒有依照 OHLC 畫。
+                        y=[abs(row["Close"] - row["Open"])],
                         base=[min(row["Open"], row["Close"])],
                         width=0.55 * 24 * 60 * 60 * 1000,
                         marker_color=color,
