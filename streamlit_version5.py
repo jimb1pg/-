@@ -560,9 +560,51 @@ with tab3:
                 if not stock_data.empty and len(stock_data) > 15:
                     if stock_data.index.tz is not None: stock_data.index = stock_data.index.tz_localize(None)
                         
-                    current_price = stock_data['Close'].iloc[-1]
-                    ytd_data = stock_data[stock_data.index.year == current_year]
-                    ytd_return = ((current_price - ytd_data['Close'].iloc[0]) / ytd_data['Close'].iloc[0]) * 100 if not ytd_data.empty else 0.0
+                    # ----------------------------------------------------
+                    # 修正後的掃描計算邏輯
+                    # ----------------------------------------------------
+                    if not stock_data.empty and len(stock_data) > 15:
+                        if stock_data.index.tz is not None: 
+                            stock_data.index = stock_data.index.tz_localize(None)
+                            
+                        current_price = stock_data['Close'].iloc[-1]
+                        
+                        # 1. 精準篩選今年 (YTD) 資料，並剔除無效 NaN 值
+                        ytd_data = stock_data[stock_data.index.year == current_year].dropna(subset=['Close'])
+                        
+                        # 2. 確定有今年的開盤/首交易日數據，否則退回使用前 250 個交易日第一筆
+                        if not ytd_data.empty and len(ytd_data) > 1:
+                            base_price = ytd_data['Close'].iloc[0]
+                        else:
+                            base_price = stock_data['Close'].iloc[0]
+                            
+                        # 3. 計算漲跌幅 (避免除以 0)
+                        ytd_return = ((current_price - base_price) / base_price) * 100 if base_price > 0 else 0.0
+                        
+                        # 4. RSI 計算
+                        delta = stock_data['Close'].diff()
+                        gain = delta.where(delta > 0, 0)
+                        loss = -delta.where(delta < 0, 0)
+                        avg_gain = gain.ewm(com=13, adjust=False).mean()
+                        avg_loss = loss.ewm(com=13, adjust=False).mean()
+                        rs = avg_gain / avg_loss
+                        
+                        rsi_series = np.where(avg_loss == 0, 100, 100 - (100 / (1 + rs)))
+                        current_rsi = float(rsi_series[-1]) if len(rsi_series) > 0 else 50.0
+                    
+                        if is_tw_stock: flag = "🇹🇼 "
+                        elif ticker in ["GC=F", "CL=F", "^GSPC", "^TNX"]: flag = "🌍 "
+                        else: flag = "🇺🇸 "
+                        
+                        scan_results.append({
+                            "代號": ticker, 
+                            "標的名稱": flag + name_dict.get(ticker, ticker), 
+                            "前三大持股 (透視)": holdings_dict.get(ticker, "無資料"),
+                            "最新收盤價": round(float(current_price), 2), 
+                            "今年來漲幅(%)": round(float(ytd_return), 2),
+                            "當前 RSI": round(float(current_rsi), 1), 
+                            "來源": "FinMind" if use_fm else "Yahoo"
+                        })
 
                     delta = stock_data['Close'].diff()
                     gain = delta.where(delta > 0, 0)
