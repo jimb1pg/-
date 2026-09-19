@@ -31,12 +31,18 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import tensorflow as tf
 from tensorflow.keras.layers import Conv1D, Dense, Dropout, BatchNormalization, GlobalAveragePooling1D, Add
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 RANDOM_SEED = 42
 LOOKBACK_DAYS = 60
 FORECAST_DAYS = 22
 TRAIN_EPOCHS = 80
+TRAIN_RATIO = 0.80
+EARLY_STOP_PATIENCE = 10
+INITIAL_LEARNING_RATE = 0.001
+MIN_LEARNING_RATE = 1e-5
+LR_PATIENCE = 5
+MAX_DAILY_RETURN = 0.10
 NEWS_MAX_DISPLAY = 30
 NEWS_RECENCY_DECAY = 0.05
 BATCH_SIZE = 32
@@ -1260,42 +1266,64 @@ TARGET_COLUMNS = ["Close_Return"]
 def create_tcn_dataset(
     df: pd.DataFrame,
     lookback: int = LOOKBACK_DAYS,
-    horizon: int = FORECAST_DAYS
+    horizon: int = FORECAST_DAYS,
+    train_ratio: float = TRAIN_RATIO
 ):
-    """
-    X：過去 60 天特徵
-    y：未來 22 天 Close 報酬率。
+    """建立 TCN 時序資料集。
 
-    Close_Return = 今日 Close / 昨日 Close - 1
+    重要：
+    1. 先依時間建立 sample。
+    2. Scaler 只使用訓練期間資料 fit。
+    3. Train / validation 嚴格依時間順序切分。
+
+    X：過去 lookback 天特徵
+    y：未來 horizon 天 Close_Return
     """
     clean = df.copy()
 
-    # 建立收盤價日報酬率
     clean["Close_Return"] = (
         clean["Close"] / clean["Close"].shift(1) - 1
     )
 
+    clean = clean.replace([np.inf, -np.inf], np.nan)
     clean = clean.dropna(
         subset=FEATURE_COLUMNS + TARGET_COLUMNS
     ).copy()
 
-    if len(clean) < lookback + horizon + 30:
+    if len(clean) < lookback + horizon + 50:
         raise ValueError(
-            f"資料不足，至少需要 {lookback + horizon + 30} 筆有效交易日。"
+            f"資料不足，目前只有 {len(clean)} 筆有效資料；"
+            f"至少需要 {lookback + horizon + 50} 筆。"
         )
 
+    train_row_end = int(len(clean) * train_ratio)
+
+    if train_row_end <= lookback + horizon:
+        raise ValueError("訓練資料不足，無法建立 TCN。")
+
+    # --------------------------------------------------------
+    # Scaler 只用訓練期間 fit，避免 validation / future leakage
+    # --------------------------------------------------------
     feature_scaler = MinMaxScaler()
     target_scaler = MinMaxScaler()
 
-    feature_values = feature_scaler.fit_transform(
+    feature_scaler.fit(
+        clean[FEATURE_COLUMNS].iloc[:train_row_end]
+    )
+    target_scaler.fit(
+        clean[TARGET_COLUMNS].iloc[:train_row_end]
+    )
+
+    feature_values = feature_scaler.transform(
         clean[FEATURE_COLUMNS]
     )
-    target_values = target_scaler.fit_transform(
+    target_values = target_scaler.transform(
         clean[TARGET_COLUMNS]
     )
 
     x_list = []
     y_list = []
+    sample_end_indices = []
 
     for end_idx in range(
         lookback,
@@ -1310,17 +1338,46 @@ def create_tcn_dataset(
         future_returns = target_values[
             end_idx:end_idx + horizon
         ]
-
         y_list.append(
             future_returns.reshape(-1)
         )
+        sample_end_indices.append(end_idx)
 
     X = np.asarray(x_list, dtype=np.float32)
     y = np.asarray(y_list, dtype=np.float32)
+    sample_end_indices = np.asarray(sample_end_indices)
+
+    # validation sample 的預測起點必須位於訓練截止點之後
+    train_mask = sample_end_indices < train_row_end
+    val_mask = sample_end_indices >= train_row_end
+
+    X_train = X[train_mask]
+    y_train = y[train_mask]
+    X_val = X[val_mask]
+    y_val = y[val_mask]
+
+    if len(X_train) < 30 or len(X_val) < 5:
+        raise ValueError(
+            f"TCN 訓練/驗證樣本不足："
+            f"train={len(X_train)}, val={len(X_val)}"
+        )
+
+    print("\n📦 TCN Dataset")
+    print(f"總樣本：{len(X)}")
+    print(f"訓練樣本：{len(X_train)}")
+    print(f"驗證樣本：{len(X_val)}")
+    print(
+        f"訓練資料截止：{clean.index[train_row_end - 1].date()}"
+    )
+    print(
+        f"驗證資料開始：{clean.index[train_row_end].date()}"
+    )
 
     return (
-        X,
-        y,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
         clean,
         feature_scaler,
         target_scaler
@@ -1372,10 +1429,7 @@ def build_tcn_model(
     n_features: int,
     horizon: int
 ):
-    """
-    TCN：
-    60 天輸入 → 多層 causal dilated Conv1D → 22 天 Close 報酬率。
-    """
+    """TCN：60 天輸入 → causal dilated Conv1D → 22 天 Close 報酬率。"""
     inputs = tf.keras.Input(
         shape=(lookback, n_features)
     )
@@ -1387,7 +1441,6 @@ def build_tcn_model(
         activation="relu"
     )(inputs)
 
-    # Dilated convolution 讓模型能看到不同時間尺度
     for dilation in [1, 2, 4, 8, 16]:
         x = tcn_residual_block(
             x,
@@ -1414,45 +1467,53 @@ def build_tcn_model(
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(
-            learning_rate=0.001
+            learning_rate=INITIAL_LEARNING_RATE
         ),
-        loss="mse",
-        metrics=["mae"]
+        loss=tf.keras.losses.Huber(delta=1.0),
+        metrics=[
+            tf.keras.metrics.MeanAbsoluteError(name="mae")
+        ]
     )
 
     return model
 
 
+@st.cache_resource(show_spinner=False)
 def train_tcn_model(
-    X: np.ndarray,
-    y: np.ndarray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     lookback: int,
     horizon: int
 ):
-    """依時間順序切分 TCN 訓練/驗證資料。"""
-    split = int(len(X) * 0.8)
-
-    if split < 30 or len(X) - split < 5:
+    """依時間順序訓練 TCN，並利用 Streamlit cache 避免重複訓練。"""
+    if len(X_train) < 30 or len(X_val) < 5:
         raise ValueError("TCN 訓練/驗證樣本不足。")
-
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
 
     model = build_tcn_model(
         lookback=lookback,
-        n_features=X.shape[2],
+        n_features=X_train.shape[2],
         horizon=horizon
     )
 
     early_stop = EarlyStopping(
         monitor="val_loss",
-        patience=12,
-        restore_best_weights=True
+        patience=EARLY_STOP_PATIENCE,
+        restore_best_weights=True,
+        verbose=1
+    )
+
+    reduce_lr = ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=LR_PATIENCE,
+        min_lr=MIN_LEARNING_RATE,
+        verbose=1
     )
 
     print(
-        f"🤖 開始訓練 TCN："
-        f"訓練 {len(X_train)} 筆，"
+        f"🤖 開始訓練 TCN：訓練 {len(X_train)} 筆，"
         f"驗證 {len(X_val)} 筆..."
     )
 
@@ -1463,11 +1524,11 @@ def train_tcn_model(
         epochs=TRAIN_EPOCHS,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        callbacks=[early_stop],
+        callbacks=[early_stop, reduce_lr],
         verbose=1
     )
 
-    return model, history, (X_val, y_val)
+    return model, history
 
 
 def make_latest_input(
@@ -1539,14 +1600,11 @@ def predict_future_ohlc(
         recent_returns.std()
     ) if len(recent_returns) > 1 else 0.01
 
-    # 硬性上限仍為 ±10%，同時避免低波動標的出現極端預測
-    adaptive_limit = min(
-        0.10,
-        recent_volatility * 3
-    )
-    adaptive_limit = max(
-        adaptive_limit,
-        0.01
+    # 依近期波動度設定 adaptive boundary，最高不超過 ±10%。
+    adaptive_limit = np.clip(
+        recent_volatility * 3,
+        0.01,
+        MAX_DAILY_RETURN
     )
 
     pred_returns = np.clip(
@@ -1662,7 +1720,7 @@ def predict_future_ohlc(
 
     forecast["Volume"] = 0.0
 
-    # 最後重新依照連續 Close 計算每日報酬率，並再次限制 ±10%
+    # 最後重新依照連續 Close 計算每日報酬率，並再次限制最大 ±10%
     previous_closes = np.concatenate([
         [last_close],
         forecast["Close"].iloc[:-1].to_numpy()
@@ -1674,8 +1732,8 @@ def predict_future_ohlc(
 
     forecast["Return"] = np.clip(
         forecast["Return"],
-        -0.10,
-        0.10
+        -MAX_DAILY_RETURN,
+        MAX_DAILY_RETURN
     )
 
     return forecast
@@ -1691,59 +1749,40 @@ def evaluate_tcn(
     target_scaler: MinMaxScaler,
     horizon: int = FORECAST_DAYS
 ):
+    """評估驗證集：MAE、RMSE、方向準確率。"""
     X_val, y_val = validation_data
 
-    pred = model.predict(
-        X_val,
-        verbose=0
-    )
-
+    pred = model.predict(X_val, verbose=0)
     n_targets = len(TARGET_COLUMNS)
 
-    pred = pred.reshape(
-        -1,
-        horizon,
-        n_targets
-    )
-    actual = y_val.reshape(
-        -1,
-        horizon,
-        n_targets
-    )
+    pred = pred.reshape(-1, horizon, n_targets)
+    actual = y_val.reshape(-1, horizon, n_targets)
 
-    pred_flat = pred.reshape(
-        -1,
-        n_targets
-    )
-    actual_flat = actual.reshape(
-        -1,
-        n_targets
-    )
+    pred_flat = pred.reshape(-1, n_targets)
+    actual_flat = actual.reshape(-1, n_targets)
 
-    pred_real = target_scaler.inverse_transform(
-        pred_flat
-    )
-    actual_real = target_scaler.inverse_transform(
-        actual_flat
-    )
+    pred_real = target_scaler.inverse_transform(pred_flat)
+    actual_real = target_scaler.inverse_transform(actual_flat)
 
     metrics = {}
 
     for i, name in enumerate(TARGET_COLUMNS):
-        mae = mean_absolute_error(
-            actual_real[:, i],
-            pred_real[:, i]
-        )
+        actual_values = actual_real[:, i]
+        pred_values = pred_real[:, i]
+
+        mae = mean_absolute_error(actual_values, pred_values)
         rmse = np.sqrt(
-            mean_squared_error(
-                actual_real[:, i],
-                pred_real[:, i]
-            )
+            mean_squared_error(actual_values, pred_values)
+        )
+
+        direction_accuracy = np.mean(
+            (actual_values > 0) == (pred_values > 0)
         )
 
         metrics[name] = {
             "MAE": float(mae),
-            "RMSE": float(rmse)
+            "RMSE": float(rmse),
+            "Direction_Accuracy": float(direction_accuracy)
         }
 
     return metrics
@@ -2055,8 +2094,10 @@ def run_prediction(
     # 5. 建立 TCN Dataset
     try:
         (
-            X,
-            y,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
             clean_df,
             feature_scaler,
             target_scaler
@@ -2068,7 +2109,7 @@ def run_prediction(
 
         print(
             f"\n📦 TCN Dataset："
-            f"X={X.shape}，y={y.shape}"
+            f"Train={X_train.shape}，Val={X_val.shape}"
         )
 
     except Exception as e:
@@ -2077,16 +2118,16 @@ def run_prediction(
 
     # 6. 訓練 TCN
     try:
-        (
-            model,
-            history,
-            validation_data
-        ) = train_tcn_model(
-            X,
-            y,
+        model, history = train_tcn_model(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
             lookback=LOOKBACK_DAYS,
             horizon=FORECAST_DAYS
         )
+
+        validation_data = (X_val, y_val)
 
     except Exception as e:
         print(f"❌ TCN 訓練失敗：{e}")
@@ -2179,9 +2220,24 @@ with tab4:
                 (cluster_series, state_series, latest_cluster, latest_state, cluster_summary, _, _) = get_market_state(feature_df)
                 feature_df["Market_Cluster"] = cluster_series.reindex(feature_df.index)
                 feature_df["Market_State"] = state_series.reindex(feature_df.index)
-                X, y, clean_df, feature_scaler, target_scaler = create_tcn_dataset(feature_df, lookback=LOOKBACK_DAYS, horizon=FORECAST_DAYS)
-                model, history, validation_data = train_tcn_model(X, y, lookback=LOOKBACK_DAYS, horizon=FORECAST_DAYS)
-                metrics = evaluate_tcn(model, validation_data, target_scaler, horizon=FORECAST_DAYS)
+                (
+                    X_train, y_train, X_val, y_val,
+                    clean_df, feature_scaler, target_scaler
+                ) = create_tcn_dataset(
+                    feature_df,
+                    lookback=LOOKBACK_DAYS,
+                    horizon=FORECAST_DAYS
+                )
+                model, history = train_tcn_model(
+                    X_train, y_train, X_val, y_val,
+                    lookback=LOOKBACK_DAYS,
+                    horizon=FORECAST_DAYS
+                )
+                validation_data = (X_val, y_val)
+                metrics = evaluate_tcn(
+                    model, validation_data, target_scaler,
+                    horizon=FORECAST_DAYS
+                )
                 forecast_df = predict_future_ohlc(model, clean_df, feature_scaler, target_scaler, lookback=LOOKBACK_DAYS, horizon=FORECAST_DAYS)
                 st.session_state["ai_result"] = {
                     "stock_df": stock_df, "feature_df": feature_df, "clean_df": clean_df,
@@ -2444,17 +2500,29 @@ with tab4:
 
         with st.container(border=True):
             st.subheader("📏 TCN 驗證集模型評估")
-            metric_df = pd.DataFrame([{"預測欄位": n, "MAE": v["MAE"], "RMSE": v["RMSE"]} for n, v in metrics.items()])
-            st.dataframe(metric_df, use_container_width=True, hide_index=True, column_config={
-                "MAE": st.column_config.NumberColumn("MAE", format="%.4f"),
-                "RMSE": st.column_config.NumberColumn("RMSE", format="%.4f")
-            })
+            metric_df = pd.DataFrame([
+                {
+                    "預測欄位": n,
+                    "MAE": v["MAE"],
+                    "RMSE": v["RMSE"],
+                    "方向準確率": v.get("Direction_Accuracy", np.nan)
+                }
+                for n, v in metrics.items()
+            ])
+            st.dataframe(
+                metric_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "MAE": st.column_config.NumberColumn("MAE", format="%.4f"),
+                    "RMSE": st.column_config.NumberColumn("RMSE", format="%.4f"),
+                    "方向準確率": st.column_config.NumberColumn("方向準確率", format="%.2f%%")
+                }
+            )
             history_obj = result.get("history", {})
             if history_obj and "loss" in history_obj:
                 fig_loss = go.Figure()
                 fig_loss.add_trace(go.Scatter(y=history_obj["loss"], mode="lines", name="Training Loss"))
                 if "val_loss" in history_obj: fig_loss.add_trace(go.Scatter(y=history_obj["val_loss"], mode="lines", name="Validation Loss"))
-                fig_loss.update_layout(title="TCN 訓練 / 驗證 Loss", height=320, template="plotly_white", xaxis_title="Epoch", yaxis_title="MSE Loss")
+                fig_loss.update_layout(title="TCN 訓練 / 驗證 Loss", height=320, template="plotly_white", xaxis_title="Epoch", yaxis_title="Huber Loss")
                 st.plotly_chart(fig_loss, use_container_width=True)
-
-
