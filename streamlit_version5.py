@@ -1600,17 +1600,28 @@ def predict_future_ohlc(
         recent_returns.std()
     ) if len(recent_returns) > 1 else 0.01
 
-    # 依近期波動度設定 adaptive boundary，最高不超過 ±10%。
+    # 依近期波動度設定合理範圍。
+    # 注意：這裡不能直接 np.clip，否則模型一旦預測超過上限，
+    # 連續多天會全部被壓成完全相同的報酬率（例如 -3.31%），
+    # K 線就會出現不自然的「連續等幅下跌」。
     adaptive_limit = np.clip(
         recent_volatility * 3,
         0.01,
         MAX_DAILY_RETURN
     )
 
+    # 使用平滑壓縮，而不是硬切斷。
+    # 大於合理範圍的預測仍會保留彼此之間的差異。
+    pred_returns = (
+        adaptive_limit
+        * np.tanh(pred_returns / adaptive_limit)
+    )
+
+    # 避免模型產生完全不合理的極端值。
     pred_returns = np.clip(
         pred_returns,
-        -adaptive_limit,
-        adaptive_limit
+        -MAX_DAILY_RETURN,
+        MAX_DAILY_RETURN
     )
 
     # ========================================================
@@ -1661,14 +1672,21 @@ def predict_future_ohlc(
         # 收盤價由 TCN 預測報酬率決定
         close_p = previous_close * (1 + daily_return)
 
-        # 開盤價參考最近 20 日的實際跳空型態
-        open_p = previous_close * (1 + median_open_gap)
+        # 開盤不要每天固定使用完全相同的跳空。
+        # 以「預測方向 + 歷史平均 gap」共同決定，
+        # 讓 K 線型態比原本自然。
+        predicted_gap = (
+            median_open_gap * 0.5
+            + daily_return * 0.15
+        )
+
+        open_p = previous_close * (1 + predicted_gap)
 
         # 避免開盤相對前收過度偏離
         open_p = np.clip(
             open_p,
-            previous_close * 0.97,
-            previous_close * 1.03
+            previous_close * 0.98,
+            previous_close * 1.02
         )
 
         # High / Low 依照最近實際 K 線影線比例重建
@@ -1720,7 +1738,9 @@ def predict_future_ohlc(
 
     forecast["Volume"] = 0.0
 
-    # 最後重新依照連續 Close 計算每日報酬率，並再次限制最大 ±10%
+    # 最後重新依照連續 Close 計算每日報酬率。
+    # 不再對 Return 做第二次硬 clip，避免畫面上的報酬率
+    # 與實際預測 Close 不一致。
     previous_closes = np.concatenate([
         [last_close],
         forecast["Close"].iloc[:-1].to_numpy()
@@ -1728,12 +1748,6 @@ def predict_future_ohlc(
 
     forecast["Return"] = (
         forecast["Close"].to_numpy() / previous_closes - 1
-    )
-
-    forecast["Return"] = np.clip(
-        forecast["Return"],
-        -MAX_DAILY_RETURN,
-        MAX_DAILY_RETURN
     )
 
     return forecast
