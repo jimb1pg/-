@@ -5,6 +5,7 @@ from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import datetime
+import logging
 from FinMind.data import DataLoader
 
 st.set_page_config(page_title="ETF 損益分析系統", layout="wide")
@@ -15,129 +16,159 @@ fm_api = DataLoader()
 api = fm_api
 
 # ============================================================
-# 統一資料來源 Router：FinMind <-> Yahoo Finance 雙向自動備援
+# 資料來源統一路由層：雙向 fallback + 錯誤紀錄 + 最終來源
 # ============================================================
+logger = logging.getLogger("stock_data_router")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-def _is_taiwan_symbol(symbol: str) -> bool:
-    """判斷是否為 FinMind 可處理的台股代碼。"""
-    s = str(symbol).strip().upper()
+def is_taiwan_stock_code(ticker: str) -> bool:
+    """判斷是否可使用 FinMind 台股資料。"""
+    t = str(ticker).strip().upper()
+    base = t.replace(".TW", "").replace(".TWO", "")
+    return t.endswith(".TW") or t.endswith(".TWO") or (base.isdigit() and 4 <= len(base) <= 6)
+
+def normalize_ticker_for_finmind(ticker: str) -> str:
+    return str(ticker).strip().upper().replace(".TW", "").replace(".TWO", "")
+
+def normalize_yahoo_ticker(ticker: str) -> str:
+    t = str(ticker).strip().upper()
+    if is_taiwan_stock_code(t) and not t.endswith((".TW", ".TWO")):
+        return f"{t}.TW"
+    return t
+
+def _validate_ohlcv(df: pd.DataFrame, min_rows: int = 2) -> bool:
     return (
-        s.endswith(".TW") or s.endswith(".TWO") or
-        (s.isdigit() and 4 <= len(s) <= 6)
+        isinstance(df, pd.DataFrame)
+        and not df.empty
+        and len(df) >= min_rows
+        and "Close" in df.columns
+        and pd.to_numeric(df["Close"], errors="coerce").notna().sum() >= min_rows
     )
 
-
-def _finmind_stock_id(symbol: str) -> str:
-    return str(symbol).strip().upper().replace(".TW", "").replace(".TWO", "")
-
-
-def _yahoo_symbol(symbol: str) -> str:
-    """把裸台股代碼轉成 Yahoo 格式；其他標的維持原樣。"""
-    s = str(symbol).strip().upper()
-    if s.isdigit() and 4 <= len(s) <= 6:
-        return f"{s}.TW"
-    return s
-
-
-def _valid_market_df(df: pd.DataFrame, min_rows: int = 2) -> bool:
-    """資料必須有 Close 且筆數足夠，才算抓取成功。"""
-    if df is None or df.empty or len(df) < min_rows:
-        return False
-    if "Close" not in df.columns:
-        return False
-    close = pd.to_numeric(df["Close"], errors="coerce")
-    return int(close.notna().sum()) >= min_rows
-
-
-def fetch_finmind_data(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """抓 FinMind；非台股標的直接回傳空表，不讓例外中斷整個 Router。"""
-    if not _is_taiwan_symbol(symbol):
+def _prepare_yahoo_data(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
         return pd.DataFrame()
-    try:
-        df = fm_api.taiwan_stock_daily(
-            stock_id=_finmind_stock_id(symbol),
-            start_date=start_date,
-            end_date=end_date
-        )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.rename(columns={
-            "date": "Date", "open": "Open", "max": "High",
-            "min": "Low", "close": "Close", "Trading_Volume": "Volume",
-            "volume": "Volume"
-        })
-        if "Date" not in df.columns or "Close" not in df.columns:
-            return pd.DataFrame()
-        if "Volume" not in df.columns:
-            df["Volume"] = 0
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date", "Close"]).copy()
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.set_index("Date").sort_index()[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-    except Exception as e:
-        print(f"⚠️ FinMind 失敗 [{symbol}]: {e}")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for col in required:
+        if col not in df.columns:
+            if col == "Volume":
+                df[col] = 0
+            else:
+                return pd.DataFrame()
+    df = df[required].copy()
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Close"])
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    return df.sort_index()
+
+def _prepare_finmind_data(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
         return pd.DataFrame()
+    rename_map = {
+        "date": "Date", "open": "Open", "max": "High",
+        "min": "Low", "close": "Close",
+        "Trading_Volume": "Volume", "volume": "Volume"
+    }
+    df = df.rename(columns=rename_map).copy()
+    required = ["Date", "Open", "High", "Low", "Close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"FinMind 缺少欄位：{missing}")
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
 
-
-def fetch_yahoo_data(symbol: str, start_date: str, end_date: str, auto_adjust: bool = True) -> pd.DataFrame:
-    """抓 Yahoo Finance，支援台股、美股、ETF、指數、期貨等代碼。"""
-    try:
-        ticker = _yahoo_symbol(symbol)
-        df = yf.Ticker(ticker).history(
-            start=start_date,
-            end=end_date,
-            auto_adjust=auto_adjust
-        )
-        if df is None or df.empty or "Close" not in df.columns:
-            return pd.DataFrame()
-        df = df.dropna(subset=["Close"]).copy()
-        if "Volume" not in df.columns:
-            df["Volume"] = 0
-        return df
-    except Exception as e:
-        print(f"⚠️ Yahoo Finance 失敗 [{symbol}]: {e}")
-        return pd.DataFrame()
-
-
-def fetch_market_data(
-    symbol: str,
+def fetch_stock_data_with_fallback(
+    ticker: str,
     preferred_source: str = "Yahoo Finance",
-    start_date: str | None = None,
-    end_date: str | None = None,
-    min_rows: int = 2,
+    start_date=None,
+    end_date=None,
     auto_adjust: bool = True,
+    min_rows: int = 2,
 ):
     """
-    統一雙向備援：
-      1. 優先使用使用者指定來源。
-      2. 空資料、資料不足、欄位缺失或 API Exception 都視為失敗。
-      3. 第一來源失敗後，自動嘗試另一來源。
-      4. 回傳 (DataFrame, 實際來源, 錯誤紀錄)。
+    統一資料路由：第一來源失敗（空資料、資料不足、例外）就自動切換另一來源。
+    回傳：(dataframe, final_source, errors, used_fallback)
     """
-    symbol = str(symbol).strip().upper()
-    if end_date is None:
-        end_date = datetime.date.today().strftime("%Y-%m-%d")
-    if start_date is None:
-        start_date = (datetime.date.today() - datetime.timedelta(days=365 * 5)).strftime("%Y-%m-%d")
-
-    p = str(preferred_source).lower()
-    prefer_fm = "finmind" in p
-    order = ["FinMind", "Yahoo Finance"] if prefer_fm else ["Yahoo Finance", "FinMind"]
+    ticker = str(ticker).strip().upper()
+    preferred = "FinMind" if "FinMind" in str(preferred_source) or str(preferred_source).lower() == "finmind" else "Yahoo Finance"
+    sources = [preferred, "Yahoo Finance" if preferred == "FinMind" else "FinMind"]
     errors = []
 
-    for source in order:
-        if source == "FinMind":
-            df = fetch_finmind_data(symbol, start_date, end_date)
-        else:
-            df = fetch_yahoo_data(symbol, start_date, end_date, auto_adjust=auto_adjust)
+    if start_date is not None and hasattr(start_date, "strftime"):
+        start_str = start_date.strftime("%Y-%m-%d")
+    else:
+        start_str = str(start_date) if start_date is not None else None
+    if end_date is not None and hasattr(end_date, "strftime"):
+        end_str = end_date.strftime("%Y-%m-%d")
+    else:
+        end_str = str(end_date) if end_date is not None else None
 
-        if _valid_market_df(df, min_rows=min_rows):
-            return df, source, errors
-        errors.append(f"{source}: 無有效資料或資料不足")
+    for attempt_no, source in enumerate(sources):
+        try:
+            if source == "FinMind":
+                if not is_taiwan_stock_code(ticker):
+                    msg = f"FinMind 不支援非台股標的 {ticker}，跳過並切換 Yahoo Finance"
+                    errors.append({"source": source, "message": msg})
+                    logger.warning(msg)
+                    continue
+                fm_id = normalize_ticker_for_finmind(ticker)
+                df = fm_api.taiwan_stock_daily(
+                    stock_id=fm_id,
+                    start_date=start_str,
+                    end_date=end_str
+                )
+                df = _prepare_finmind_data(df)
+            else:
+                yahoo_ticker = normalize_yahoo_ticker(ticker)
+                df = yf.Ticker(yahoo_ticker).history(
+                    start=start_str,
+                    end=end_str,
+                    auto_adjust=auto_adjust
+                )
+                df = _prepare_yahoo_data(df)
 
-    return pd.DataFrame(), None, errors
+            if _validate_ohlcv(df, min_rows=min_rows):
+                final_source = source + (" (備援)" if attempt_no > 0 else "")
+                if attempt_no > 0:
+                    logger.info(f"{ticker}: {preferred} 失敗，已成功切換至 {source}")
+                else:
+                    logger.info(f"{ticker}: 使用 {source} 成功取得資料")
+                return df, final_source, errors, attempt_no > 0
 
+            msg = f"{source} 回傳空資料或資料不足（至少需要 {min_rows} 筆）"
+            errors.append({"source": source, "message": msg})
+            logger.warning(f"{ticker}: {msg}")
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            errors.append({"source": source, "message": msg})
+            logger.exception(f"{ticker}: {source} 取得資料失敗")
+
+    logger.error(f"{ticker}: Yahoo Finance 與 FinMind 皆無法取得資料")
+    return pd.DataFrame(), "無可用資料", errors, False
+
+def render_fetch_status(ticker: str, final_source: str, errors: list, used_fallback: bool, key_prefix: str):
+    """在 Streamlit 顯示最終資料來源與 fallback 錯誤紀錄。"""
+    if final_source == "無可用資料":
+        st.error(f"❌ {ticker}：Yahoo Finance 與 FinMind 均無法取得資料。")
+    elif used_fallback:
+        st.warning(f"⚠️ {ticker}：原優先來源失敗，已自動切換 → **{final_source}**")
+    else:
+        st.success(f"✅ {ticker}：最終資料來源 → **{final_source}**")
+
+    if errors:
+        with st.expander("🔎 查看資料來源錯誤紀錄", expanded=used_fallback):
+            for item in errors:
+                st.write(f"- **{item['source']}**：{item['message']}")
 
 # ============================================================
 # Version 5 AI 核心模組
@@ -229,7 +260,7 @@ with tab1:
                 etf_option = st.text_input("請輸入代碼 (台股請加 .TW)：", "00940.TW", key="t1_custom")
             else:
                 etf_option = selected_preset.split(" ")[0]
-            data_source = st.radio("優先資料來源：", ("Yahoo Finance", "FinMind (優先；失敗自動切 Yahoo)"), horizontal=True, key="t1_source")
+            data_source = st.radio("優先資料來源：", ("Yahoo Finance", "FinMind (僅限台股)"), horizontal=True, key="t1_source")
             
         with t1_c2:
             quick_time = st.radio("時間區間：", ["近 1 個月", "近 3 個月", "今年以來", "全部歷史", "進階自訂..."], horizontal=True, key="t1_time")
@@ -275,17 +306,19 @@ with tab1:
             
             fetch_start_date = display_start_date - datetime.timedelta(days=90)
 
-            hist_data, actual_source, source_errors = fetch_market_data(
+            hist_data, actual_source, fetch_errors, used_fallback = fetch_stock_data_with_fallback(
                 etf_option,
                 preferred_source=data_source,
-                start_date=fetch_start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
+                start_date=fetch_start_date,
+                end_date=end_date,
+                auto_adjust=True,
                 min_rows=2,
-                auto_adjust=True
             )
             fetch_success = not hist_data.empty
-            if not fetch_success:
-                st.warning(f"⚠️ Yahoo / FinMind 均無法取得 {etf_option} 資料。" + (f" {'；'.join(source_errors)}" if source_errors else ""))
+
+            render_fetch_status(
+                etf_option, actual_source, fetch_errors, used_fallback, "t1"
+            )
 
             if fetch_success:
                 if hist_data.index.tz is not None:
@@ -504,7 +537,7 @@ with tab2:
             # 🌟 核心增強：加入資料來源選擇，預設為具備股價還原功能的 Yahoo Finance
             t2_source = st.radio("優先資料來源設定：", ("Yahoo Finance", "FinMind (僅限台股)"), horizontal=True, key="t2_source")
             
-        if t2_source == "FinMind (優先；失敗自動切 Yahoo)":
+        if t2_source == "FinMind (僅限台股)":
             st.caption("⚠️ 提示：FinMind 提供未經除權息調整之歷史原價。長期回測建議切換為 **Yahoo Finance**（具備自動還原股價功能），計算總報酬率與真實 ROI 才會精準。")
             
         t2_button = st.button("🚀 執行定期定額回測", use_container_width=True, key="t2_btn")
@@ -514,20 +547,20 @@ with tab2:
             try:
                 start_date_str = t2_start_date.strftime("%Y-%m-%d")
                 end_date_str = datetime.date.today().strftime("%Y-%m-%d")
-                
-                actual_t2_source = t2_source
-                bt_data = pd.DataFrame()
-                
-                # 統一資料路由：優先來源失敗時自動切換另一來源
-                bt_data, actual_t2_source, t2_errors = fetch_market_data(
+
+                bt_data, actual_t2_source, t2_errors, t2_used_fallback = fetch_stock_data_with_fallback(
                     t2_target,
                     preferred_source=t2_source,
                     start_date=start_date_str,
                     end_date=end_date_str,
+                    auto_adjust=True,
                     min_rows=2,
-                    auto_adjust=True
                 )
-                
+
+                render_fetch_status(
+                    t2_target, actual_t2_source, t2_errors, t2_used_fallback, "t2"
+                )
+
                 if not bt_data.empty and len(bt_data) > 1:
                     # 🌟 核心防呆：抹除時區資訊避免 to_period 時異常
                     if bt_data.index.tz is not None:
@@ -610,7 +643,7 @@ with tab3:
                 tickers_to_fetch = pools[scan_pool_name]
                 
         with scan_c2:
-            scan_source = st.radio("底層 API 路由策略", ["自動 (台股優先 FinMind / 其他優先 Yahoo)", "優先 Yahoo（失敗自動切 FinMind）", "優先 FinMind（失敗自動切 Yahoo）"], key="t3_src")
+            scan_source = st.radio("底層 API 路由策略", ["自動 (台股FinMind/其他Yahoo)", "強制 Yahoo", "強制 FinMind"], key="t3_src")
             
             total_tickers = len(tickers_to_fetch)
             if total_tickers <= 5:
@@ -639,57 +672,73 @@ with tab3:
         end_date_str = datetime.date.today().strftime("%Y-%m-%d")
         fetch_start_date = (datetime.date(current_year, 1, 1) - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
 
+        scan_errors = []
+
         for i, ticker in enumerate(tickers_to_fetch):
             progress_bar.progress((i + 1) / len(tickers_to_fetch), text=f"正在分析 {name_dict.get(ticker, ticker)}...")
-            
-            is_tw_stock = _is_taiwan_symbol(ticker)
-            if scan_source == "自動 (台股優先 FinMind / 其他優先 Yahoo)":
+
+            is_tw_stock = is_taiwan_stock_code(ticker)
+            if scan_source == "自動 (台股FinMind/其他Yahoo)":
                 preferred_scan_source = "FinMind" if is_tw_stock else "Yahoo Finance"
-            elif "Yahoo" in scan_source:
-                preferred_scan_source = "Yahoo Finance"
-            else:
+            elif scan_source == "強制 FinMind":
                 preferred_scan_source = "FinMind"
+            else:
+                preferred_scan_source = "Yahoo Finance"
 
             try:
-                stock_data, actual_scan_source, scan_errors = fetch_market_data(
+                stock_data, final_scan_source, ticker_errors, scan_used_fallback = fetch_stock_data_with_fallback(
                     ticker,
                     preferred_source=preferred_scan_source,
                     start_date=fetch_start_date,
                     end_date=end_date_str,
+                    auto_adjust=True,
                     min_rows=16,
-                    auto_adjust=True
                 )
-                if stock_data.empty:
-                    continue
-                
-                if not stock_data.empty and len(stock_data) > 15:
-                    if stock_data.index.tz is not None: stock_data.index = stock_data.index.tz_localize(None)
-                        
-                    current_price = stock_data['Close'].iloc[-1]
-                    ytd_data = stock_data[stock_data.index.year == current_year]
-                    ytd_return = ((current_price - ytd_data['Close'].iloc[0]) / ytd_data['Close'].iloc[0]) * 100 if not ytd_data.empty else 0.0
 
-                    delta = stock_data['Close'].diff()
+                if ticker_errors:
+                    for item in ticker_errors:
+                        scan_errors.append({
+                            "代號": ticker,
+                            "來源": item["source"],
+                            "錯誤": item["message"]
+                        })
+
+                if not stock_data.empty and len(stock_data) > 15:
+                    if getattr(stock_data.index, "tz", None) is not None:
+                        stock_data.index = stock_data.index.tz_localize(None)
+
+                    current_price = stock_data["Close"].iloc[-1]
+                    ytd_data = stock_data[stock_data.index.year == current_year]
+                    ytd_return = ((current_price - ytd_data["Close"].iloc[0]) / ytd_data["Close"].iloc[0]) * 100 if not ytd_data.empty else 0.0
+
+                    delta = stock_data["Close"].diff()
                     gain = delta.where(delta > 0, 0)
                     loss = -delta.where(delta < 0, 0)
                     avg_gain = gain.ewm(com=13, adjust=False).mean()
                     avg_loss = loss.ewm(com=13, adjust=False).mean()
                     rs = avg_gain / avg_loss
                     current_rsi = (np.where(avg_loss == 0, 100, 100 - (100 / (1 + rs))))[-1]
-                    
+
                     if is_tw_stock: flag = "🇹🇼 "
                     elif ticker in ["GC=F", "CL=F", "^GSPC", "^TNX"]: flag = "🌍 "
                     else: flag = "🇺🇸 "
-                    
+
                     scan_results.append({
-                        "代號": ticker, "標的名稱": flag + name_dict.get(ticker, ticker), 
+                        "代號": ticker, "標的名稱": flag + name_dict.get(ticker, ticker),
                         "前三大持股 (透視)": holdings_dict.get(ticker, "無資料"),
                         "最新收盤價": round(current_price, 2), "今年來漲幅(%)": round(ytd_return, 2),
-                        "當前 RSI": round(current_rsi, 1), "來源": actual_scan_source or "未知"
+                        "當前 RSI": round(current_rsi, 1), "來源": final_scan_source
                     })
-            except Exception:
-                pass 
-        
+                else:
+                    scan_errors.append({
+                        "代號": ticker,
+                        "來源": final_scan_source,
+                        "錯誤": "兩個資料來源均未取得足夠資料"
+                    })
+            except Exception as e:
+                logger.exception(f"{ticker}: 市場掃描處理失敗")
+                scan_errors.append({"代號": ticker, "來源": "處理階段", "錯誤": f"{type(e).__name__}: {e}"})
+
         progress_bar.empty()
         
         if len(scan_results) > 0:
@@ -711,6 +760,9 @@ with tab3:
                 "今年來漲幅(%)": st.column_config.NumberColumn("今年漲幅(%)", format="%.2f %%"),
                 "當前 RSI": st.column_config.ProgressColumn("短期動能 (RSI)", format="%.1f", min_value=0, max_value=100)
             })
+            if scan_errors:
+                with st.expander(f"🔎 查看本次掃描的資料來源錯誤紀錄（{len(scan_errors)} 筆）", expanded=False):
+                    st.dataframe(pd.DataFrame(scan_errors), use_container_width=True, hide_index=True)
         else:
             st.error("❌ 獲取資料失敗。可能是 API 連線限制或輸入的代碼無效。")
 
@@ -730,83 +782,36 @@ def get_date_range(years: int = 5):
     return start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
-def normalize_finmind_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """將 FinMind 欄位整理為統一 OHLCV 格式。"""
-    if df.empty:
-        return df
-
-    rename_map = {
-        "date": "Date",
-        "open": "Open",
-        "max": "High",
-        "min": "Low",
-        "close": "Close",
-        "Trading_Volume": "Volume",
-        "volume": "Volume"
-    }
-    df = df.rename(columns=rename_map)
-
-    required = ["Date", "Open", "High", "Low", "Close"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"FinMind 回傳資料缺少欄位：{missing}")
-
-    if "Volume" not in df.columns:
-        df["Volume"] = 0
-
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.set_index("Date").sort_index()
-
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-
-
-# ============================================================
-# 2. 股票資料下載
-# ============================================================
-
-def get_finmind_data(stock_id: str, years: int = 5) -> pd.DataFrame:
+def get_stock_data_with_meta(
+    stock_id: str,
+    data_source: str = "finmind",
+    years: int = 5
+):
+    """AI 模組專用：雙向 fallback，回傳資料、最終來源與錯誤紀錄。"""
     start_date, end_date = get_date_range(years)
-    return fetch_finmind_data(stock_id, start_date, end_date)
-
-
-def get_yfinance_data(stock_id: str, years: int = 5) -> pd.DataFrame:
-    start_date, end_date = get_date_range(years)
-    return fetch_yahoo_data(stock_id, start_date, end_date, auto_adjust=False)
-
+    preferred = "FinMind" if str(data_source).lower() == "finmind" else "Yahoo Finance"
+    return fetch_stock_data_with_fallback(
+        stock_id,
+        preferred_source=preferred,
+        start_date=start_date,
+        end_date=end_date,
+        auto_adjust=False,
+        min_rows=LOOKBACK_DAYS + FORECAST_DAYS + 20
+    )
 
 def get_stock_data(
     stock_id: str,
     data_source: str = "finmind",
-    years: int = 5,
-    return_source: bool = False
-):
-    """取得歷史資料；指定來源失敗時自動切換另一來源。"""
-    stock_id = stock_id.strip().upper()
-    start_date, end_date = get_date_range(years)
-    df, actual_source, errors = fetch_market_data(
-        stock_id,
-        preferred_source=data_source,
-        start_date=start_date,
-        end_date=end_date,
-        min_rows=max(2, LOOKBACK_DAYS + 5),
-        auto_adjust=False
+    years: int = 5
+) -> pd.DataFrame:
+    """依資料來源下載股票資料；若第一來源失敗，自動切換另一來源。"""
+    df, final_source, errors, used_fallback = get_stock_data_with_meta(
+        stock_id, data_source, years
     )
-
     if df.empty:
-        print(f"❌ 所有資料來源皆失敗 [{stock_id}]：{'；'.join(errors)}")
+        print(f"❌ {stock_id}：無法取得資料；來源錯誤：{errors}")
     else:
-        print(
-            f"✅ 取得 {len(df)} 筆資料，實際來源：{actual_source}："
-            f"{df.index.min().date()} ~ {df.index.max().date()}"
-        )
-        if actual_source and actual_source.lower() != str(data_source).lower():
-            print(f"🔄 已由 {data_source} 自動切換至 {actual_source}")
-
-    if return_source:
-        return df, actual_source, errors
+        print(f"✅ {stock_id}：最終資料來源 = {final_source}，共 {len(df)} 筆")
     return df
 
 
@@ -2465,7 +2470,7 @@ with tab4:
             ai_target = st.text_input("輸入台股 / ETF 代碼：", "0050", key="ai_target")
             ai_target = ai_target.strip().upper().replace(".TW", "").replace(".TWO", "")
         with ai_c2:
-            ai_source_label = st.radio("模型優先資料來源（失敗自動切換）：", ("FinMind", "Yahoo Finance"), horizontal=True, key="ai_source")
+            ai_source_label = st.radio("模型資料來源：", ("FinMind", "Yahoo Finance"), horizontal=True, key="ai_source")
             ai_source = "finmind" if ai_source_label == "FinMind" else "yfinance"
         with ai_c3:
             ai_years = st.selectbox("模型歷史資料：", [3, 5, 7, 10], index=1, format_func=lambda x: f"近 {x} 年", key="ai_years")
@@ -2485,9 +2490,14 @@ with tab4:
             st.stop()
         try:
             with st.spinner(f"正在建立 {ai_target} 的 AI 多模態預測模型，首次執行可能需要下載 FinBERT... "):
-                stock_df, actual_ai_source, ai_source_errors = get_stock_data(ai_target, data_source=ai_source, years=ai_years, return_source=True)
+                stock_df, ai_final_source, ai_fetch_errors, ai_used_fallback = get_stock_data_with_meta(
+                    ai_target, data_source=ai_source, years=ai_years
+                )
+                render_fetch_status(
+                    ai_target, ai_final_source, ai_fetch_errors, ai_used_fallback, "ai"
+                )
                 if stock_df.empty:
-                    raise ValueError("無法取得歷史資料，請確認代碼與資料來源。")
+                    raise ValueError("Yahoo Finance 與 FinMind 均無法取得歷史資料，請確認代碼或 API 狀態。")
                 sentiment_df = get_news_sentiment(ai_target, stock_df.index)
                 feature_df = prepare_feature_data(stock_df, sentiment_df)
                 (cluster_series, state_series, latest_cluster, latest_state, cluster_summary, _, _) = get_market_state(feature_df)
@@ -2533,7 +2543,9 @@ with tab4:
                     "stock_df": stock_df, "feature_df": feature_df, "clean_df": clean_df,
                     "sentiment_df": sentiment_df, "latest_state": latest_state, "latest_cluster": latest_cluster,
                     "cluster_summary": cluster_summary, "metrics": metrics, "forecast_df": forecast_df,
-                    "history": history.history, "source": actual_ai_source or ai_source_label, "target": ai_target, "years": ai_years
+                    "history": history.history, "source": ai_final_source, "preferred_source": ai_source_label,
+                    "fetch_errors": ai_fetch_errors, "used_fallback": ai_used_fallback,
+                    "target": ai_target, "years": ai_years
                 }
         except Exception as e:
             st.error(f"❌ Version 5 執行失敗：{e}")
@@ -2552,7 +2564,11 @@ with tab4:
         final_forecast_close = float(forecast_df["Close"].iloc[-1])
         month_return = (final_forecast_close / last_close - 1) * 100
 
-        st.success(f"✅ AI 預測完成！標的：**{result['target']}** | 資料來源：{result['source']} | 歷史資料：{result['years']} 年")
+        st.success(f"✅ AI 預測完成！標的：**{result['target']}** | 最終資料來源：**{result['source']}** | 歷史資料：{result['years']} 年")
+        if result.get("fetch_errors"):
+            with st.expander("🔎 查看 AI 資料來源 fallback 紀錄", expanded=result.get("used_fallback", False)):
+                for item in result["fetch_errors"]:
+                    st.write(f"- **{item['source']}**：{item['message']}")
         r1, r2, r3, r4 = st.columns(4)
         with r1: st.metric("目前收盤價", f"{last_close:.2f}")
         with r2: st.metric("KMeans 市場狀態", f"{state_icon} {latest_state}")
@@ -2821,4 +2837,3 @@ with tab4:
                 if "val_loss" in history_obj: fig_loss.add_trace(go.Scatter(y=history_obj["val_loss"], mode="lines", name="Validation Loss"))
                 fig_loss.update_layout(title="TCN 訓練 / 驗證 Loss", height=320, template="plotly_white", xaxis_title="Epoch", yaxis_title="Huber Loss")
                 st.plotly_chart(fig_loss, use_container_width=True)
-
