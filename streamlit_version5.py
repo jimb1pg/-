@@ -150,91 +150,37 @@ with tab1:
             
             fetch_start_date = display_start_date - datetime.timedelta(days=90)
 
-try:
-if data_source == "Yahoo Finance":
-# 第一順位：Yahoo Finance
-try:
-temp_data = yf.Ticker(etf_option).history(
-start=fetch_start_date,
-end=end_date,
-auto_adjust=True
-)
-temp_data = temp_data.dropna(subset=["Close"])
-except Exception:
-temp_data = pd.DataFrame()
+            try:
+                if data_source == "Yahoo Finance":
+                    temp_data = yf.Ticker(etf_option).history(start=fetch_start_date, end=end_date, auto_adjust=True)
+                    # 👇 加上這行：無情刪除沒有收盤價的 NaN 幽靈數據
+                    temp_data = temp_data.dropna(subset=['Close']) 
+                    
+                    if not temp_data.empty and len(temp_data) > 1:
+                        hist_data = temp_data
+                        fetch_success = True
+                    else:
+                        if etf_option.endswith(".TW"):
+                            actual_source = "FinMind (備援)"
+                            fm_id = etf_option.replace(".TW", "")
+                            fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
+                            if not fm_df.empty:
+                                fm_df = fm_df.rename(columns={'date': 'Date', 'open': 'Open', 'max': 'High', 'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'})
+                                fm_df['Date'] = pd.to_datetime(fm_df['Date'])
+                                hist_data = fm_df.set_index('Date')
+                                fetch_success = True
+                else:
+                    fm_id = etf_option.replace(".TW", "")
+                    fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date.strftime("%Y-%m-%d"), end_date=end_date.strftime("%Y-%m-%d"))
+                    if not fm_df.empty:
+                        fm_df = fm_df.rename(columns={'date': 'Date', 'open': 'Open', 'max': 'High', 'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'})
+                        fm_df['Date'] = pd.to_datetime(fm_df['Date'])
+                        hist_data = fm_df.set_index('Date')
+                        fetch_success = True
+            except Exception:
+                pass
 
-if not temp_data.empty and len(temp_data) > 1:
-hist_data = temp_data
-fetch_success = True
-actual_source = "Yahoo Finance"
-else:
-# Yahoo 無資料 → 自動切 FinMind（僅台股）
-if etf_option.endswith(".TW") or etf_option.endswith(".TWO"):
-actual_source = "FinMind (備援)"
-fm_id = etf_option.replace(".TW", "").replace(".TWO", "")
-try:
-fm_df = fm_api.taiwan_stock_daily(
-stock_id=fm_id,
-start_date=fetch_start_date.strftime("%Y-%m-%d"),
-end_date=end_date.strftime("%Y-%m-%d")
-)
-except Exception:
-fm_df = pd.DataFrame()
-
-if fm_df is not None and not fm_df.empty:
-fm_df = fm_df.rename(columns={
-"date": "Date", "open": "Open", "max": "High",
-"min": "Low", "close": "Close",
-"Trading_Volume": "Volume"
-})
-fm_df["Date"] = pd.to_datetime(fm_df["Date"])
-hist_data = fm_df.set_index("Date")
-fetch_success = len(hist_data) > 1
-
-else:
-# 第一順位：FinMind
-if etf_option.endswith(".TW") or etf_option.endswith(".TWO"):
-fm_id = etf_option.replace(".TW", "").replace(".TWO", "")
-try:
-fm_df = fm_api.taiwan_stock_daily(
-stock_id=fm_id,
-start_date=fetch_start_date.strftime("%Y-%m-%d"),
-end_date=end_date.strftime("%Y-%m-%d")
-)
-except Exception:
-fm_df = pd.DataFrame()
-
-if fm_df is not None and not fm_df.empty:
-fm_df = fm_df.rename(columns={
-"date": "Date", "open": "Open", "max": "High",
-"min": "Low", "close": "Close",
-"Trading_Volume": "Volume"
-})
-fm_df["Date"] = pd.to_datetime(fm_df["Date"])
-hist_data = fm_df.set_index("Date")
-fetch_success = len(hist_data) > 1
-if fetch_success:
-actual_source = "FinMind"
-
-# FinMind 無資料 / 非台股 → 自動切 Yahoo
-if not fetch_success:
-actual_source = "Yahoo Finance (備援)"
-try:
-temp_data = yf.Ticker(etf_option).history(
-start=fetch_start_date,
-end=end_date,
-auto_adjust=True
-)
-temp_data = temp_data.dropna(subset=["Close"])
-except Exception:
-temp_data = pd.DataFrame()
-
-if not temp_data.empty and len(temp_data) > 1:
-hist_data = temp_data
-fetch_success = True
-
-except Exception:
-fetch_success = False
+            if fetch_success:
                 if hist_data.index.tz is not None:
                     hist_data.index = hist_data.index.tz_localize(None)
 
@@ -466,69 +412,25 @@ with tab2:
                 bt_data = pd.DataFrame()
                 
                 # 🌟 核心增強：根據使用者選取的來源進行智慧路由與備援
-# 雙向 fallback：不論使用者先選哪個來源，失敗都自動切另一個來源
-if t2_source == "Yahoo Finance":
-try:
-bt_data = yf.Ticker(t2_target).history(
-start=start_date_str, end=end_date_str, auto_adjust=True
-)
-bt_data = bt_data.dropna(subset=["Close"])
-except Exception:
-bt_data = pd.DataFrame()
-
-if not bt_data.empty and len(bt_data) > 1:
-actual_t2_source = "Yahoo Finance"
-else:
-actual_t2_source = "FinMind (備援)"
-bt_data = pd.DataFrame()
-if t2_target.endswith(".TW") or t2_target.endswith(".TWO"):
-fm_id = t2_target.replace(".TW", "").replace(".TWO", "")
-try:
-bt_df = fm_api.taiwan_stock_daily(
-stock_id=fm_id,
-start_date=start_date_str,
-end_date=end_date_str
-)
-except Exception:
-bt_df = pd.DataFrame()
-
-if bt_df is not None and not bt_df.empty:
-bt_df = bt_df.rename(columns={
-"date": "Date", "close": "Close"
-})
-bt_df["Date"] = pd.to_datetime(bt_df["Date"])
-bt_data = bt_df.set_index("Date")
-else:
-# 第一順位：FinMind
-bt_data = pd.DataFrame()
-if t2_target.endswith(".TW") or t2_target.endswith(".TWO"):
-fm_id = t2_target.replace(".TW", "").replace(".TWO", "")
-try:
-bt_df = fm_api.taiwan_stock_daily(
-stock_id=fm_id,
-start_date=start_date_str,
-end_date=end_date_str
-)
-except Exception:
-bt_df = pd.DataFrame()
-
-if bt_df is not None and not bt_df.empty:
-bt_df = bt_df.rename(columns={
-"date": "Date", "close": "Close"
-})
-bt_df["Date"] = pd.to_datetime(bt_df["Date"])
-bt_data = bt_df.set_index("Date")
-
-# FinMind 失敗或非台股 → Yahoo fallback
-if bt_data.empty or len(bt_data) <= 1:
-actual_t2_source = "Yahoo Finance (備援)"
-try:
-bt_data = yf.Ticker(t2_target).history(
-start=start_date_str, end=end_date_str, auto_adjust=True
-)
-bt_data = bt_data.dropna(subset=["Close"])
-except Exception:
-bt_data = pd.DataFrame()
+                if t2_source == "Yahoo Finance":
+                    bt_data = yf.Ticker(t2_target).history(start=start_date_str, end=end_date_str, auto_adjust=True)
+                    bt_data = bt_data.dropna(subset=['Close']) 
+                    if (bt_data.empty or len(bt_data) <= 1) and t2_target.endswith(".TW"):
+                        actual_t2_source = "FinMind (備援)"
+                        fm_id = t2_target.replace(".TW", "")
+                        bt_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=start_date_str, end_date=end_date_str)
+                        if not bt_df.empty:
+                            bt_df = bt_df.rename(columns={'date': 'Date', 'close': 'Close'})
+                            bt_df['Date'] = pd.to_datetime(bt_df['Date'])
+                            bt_data = bt_df.set_index('Date')
+                else:
+                    fm_id = t2_target.replace(".TW", "")
+                    bt_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=start_date_str, end_date=end_date_str)
+                    if not bt_df.empty:
+                        bt_df = bt_df.rename(columns={'date': 'Date', 'close': 'Close'})
+                        bt_df['Date'] = pd.to_datetime(bt_df['Date'])
+                        bt_data = bt_df.set_index('Date')
+                
                 if not bt_data.empty and len(bt_data) > 1:
                     # 🌟 核心防呆：抹除時區資訊避免 to_period 時異常
                     if bt_data.index.tz is not None:
@@ -644,64 +546,24 @@ with tab3:
             progress_bar.progress((i + 1) / len(tickers_to_fetch), text=f"正在分析 {name_dict.get(ticker, ticker)}...")
             
             is_tw_stock = ticker.endswith(".TW") or ticker.endswith(".TWO") or (ticker.isdigit() and len(ticker) >= 4)
-if scan_source == "自動 (台股FinMind/其他Yahoo)":
-preferred_source = "FinMind" if is_tw_stock else "Yahoo"
-elif scan_source == "強制 FinMind":
-preferred_source = "FinMind"
-else:
-preferred_source = "Yahoo"
-
-try:
-stock_data = pd.DataFrame()
-actual_scan_source = preferred_source
-
-def fetch_scan_finmind():
-if not is_tw_stock:
-return pd.DataFrame()
-fm_id = ticker.replace(".TW", "").replace(".TWO", "")
-try:
-fm_df = fm_api.taiwan_stock_daily(
-stock_id=fm_id,
-start_date=fetch_start_date,
-end_date=end_date_str
-)
-except Exception:
-return pd.DataFrame()
-if fm_df is None or fm_df.empty or len(fm_df) <= 15:
-return pd.DataFrame()
-fm_df = fm_df.rename(columns={
-"date": "Date", "close": "Close"
-})
-fm_df["Date"] = pd.to_datetime(fm_df["Date"])
-return fm_df.set_index("Date")
-
-def fetch_scan_yahoo():
-try:
-yahoo_df = yf.Ticker(ticker).history(
-start=fetch_start_date,
-end=end_date_str,
-auto_adjust=True
-)
-except Exception:
-return pd.DataFrame()
-if yahoo_df is None or yahoo_df.empty or len(yahoo_df) <= 15:
-return pd.DataFrame()
-yahoo_df = yahoo_df.dropna(subset=["Close"])
-if yahoo_df.index.tz is not None:
-yahoo_df.index = yahoo_df.index.tz_localize(None)
-return yahoo_df
-
-# 第一來源失敗後，立即切換第二來源
-if preferred_source == "FinMind":
-stock_data = fetch_scan_finmind()
-if stock_data.empty:
-stock_data = fetch_scan_yahoo()
-actual_scan_source = "Yahoo (備援)"
-else:
-stock_data = fetch_scan_yahoo()
-if stock_data.empty:
-stock_data = fetch_scan_finmind()
-actual_scan_source = "FinMind (備援)"
+            use_fm = False
+            
+            if scan_source == "自動 (台股FinMind/其他Yahoo)": use_fm = is_tw_stock
+            elif scan_source == "強制 FinMind": use_fm = True
+                
+            try:
+                stock_data = pd.DataFrame()
+                
+                if use_fm:
+                    fm_id = ticker.replace(".TW", "").replace(".TWO", "")
+                    fm_df = fm_api.taiwan_stock_daily(stock_id=fm_id, start_date=fetch_start_date, end_date=end_date_str)
+                    if not fm_df.empty and len(fm_df) > 15:
+                        fm_df = fm_df.rename(columns={'date': 'Date', 'close': 'Close'})
+                        fm_df['Date'] = pd.to_datetime(fm_df['Date'])
+                        stock_data = fm_df.set_index('Date')
+                else:
+                    stock_data = yf.Ticker(ticker).history(start=fetch_start_date, end=end_date_str, auto_adjust=True)
+                
                 if not stock_data.empty and len(stock_data) > 15:
                     if stock_data.index.tz is not None: stock_data.index = stock_data.index.tz_localize(None)
                         
@@ -725,7 +587,7 @@ actual_scan_source = "FinMind (備援)"
                         "代號": ticker, "標的名稱": flag + name_dict.get(ticker, ticker), 
                         "前三大持股 (透視)": holdings_dict.get(ticker, "無資料"),
                         "最新收盤價": round(current_price, 2), "今年來漲幅(%)": round(ytd_return, 2),
-"當前 RSI": round(current_rsi, 1), "來源": actual_scan_source
+                        "當前 RSI": round(current_rsi, 1), "來源": "FinMind" if use_fm else "Yahoo"
                     })
             except Exception:
                 pass 
@@ -851,45 +713,32 @@ def get_yfinance_data(stock_id: str, years: int = 5) -> pd.DataFrame:
 
 
 def get_stock_data(
-stock_id: str,
-data_source: str = "finmind",
-years: int = 5
+    stock_id: str,
+    data_source: str = "finmind",
+    years: int = 5
 ) -> pd.DataFrame:
-"""依使用者指定來源下載；失敗時自動切換另一來源。"""
-global last_stock_data_source
-stock_id = stock_id.strip().upper()
+    """依資料來源下載股票資料。"""
+    stock_id = stock_id.strip().upper()
 
-first_source = "yfinance" if data_source == "yfinance" else "finmind"
-second_source = "finmind" if first_source == "yfinance" else "yfinance"
+    try:
+        if data_source == "yfinance":
+            df = get_yfinance_data(stock_id, years)
+        else:
+            df = get_finmind_data(stock_id, years)
 
-def try_source(source: str) -> pd.DataFrame:
-try:
-if source == "yfinance":
-return get_yfinance_data(stock_id, years)
-return get_finmind_data(stock_id, years)
-except Exception as e:
-print(f"⚠️ {source} 下載失敗：{e}")
-return pd.DataFrame()
+        if df.empty:
+            print("⚠️ 查無資料，請確認股票代碼或資料來源。")
+            return df
 
-df = try_source(first_source)
-actual_source = first_source
-    last_stock_data_source = actual_source
-if df.empty:
-print(f"⚠️ {first_source} 查無資料，啟動 {second_source} 備援。")
-df = try_source(second_source)
-actual_source = second_source
-last_stock_data_source = actual_source
+        print(
+            f"✅ 取得 {len(df)} 筆資料："
+            f"{df.index.min().date()} ~ {df.index.max().date()}"
+        )
+        return df
 
-if df.empty:
-print("❌ FinMind / Yahoo Finance 均無法取得資料。")
-return pd.DataFrame()
-
-print(
-f"✅ 取得 {len(df)} 筆資料（來源：{actual_source}）："
-f"{df.index.min().date()} ~ {df.index.max().date()}"
-)
-return df
-
+    except Exception as e:
+        print(f"❌ 股票資料下載失敗：{e}")
+        return pd.DataFrame()
 
 
 # ============================================================
@@ -2615,7 +2464,7 @@ with tab4:
                     "stock_df": stock_df, "feature_df": feature_df, "clean_df": clean_df,
                     "sentiment_df": sentiment_df, "latest_state": latest_state, "latest_cluster": latest_cluster,
                     "cluster_summary": cluster_summary, "metrics": metrics, "forecast_df": forecast_df,
-                    "history": history.history, "source": last_stock_data_source, "target": ai_target, "years": ai_years
+                    "history": history.history, "source": ai_source_label, "target": ai_target, "years": ai_years
                 }
         except Exception as e:
             st.error(f"❌ Version 5 執行失敗：{e}")
