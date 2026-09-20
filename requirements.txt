@@ -9,3 +9,4 @@ transformers
 scikit-learn
 tensorflow
 python-dateutil
+exchange_calendars
