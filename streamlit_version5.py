@@ -646,14 +646,17 @@ with tab3:
             scan_source = st.radio("底層 API 路由策略", ["自動 (台股FinMind/其他Yahoo)", "強制 Yahoo", "強制 FinMind"], key="t3_src")
             
             total_tickers = len(tickers_to_fetch)
-            if total_tickers <= 5:
-                count_options = ["顯示全部 (1~5檔)", 3]
-            elif total_tickers <= 10:
-                count_options = [f"顯示全部 ({total_tickers}檔)", 3, 5]
-            else:
-                count_options = [f"顯示全部 ({total_tickers}檔)", 3, 5, 10, 20]
-                
-            scan_count = st.selectbox("顯示結果數量", count_options, key="t3_cnt")
+
+            # 顯示結果數量：讓使用者自由輸入。
+            # 若輸入超過實際股票數量，後續會自動以全部結果顯示。
+            scan_count = st.number_input(
+                "顯示結果數量",
+                min_value=1,
+                value=min(10, total_tickers),
+                step=1,
+                key="t3_cnt",
+                help=f"可輸入 1～{total_tickers}。若輸入超過 {total_tickers} 檔，將自動顯示全部。"
+            )
             
         with scan_c3:
             scan_strategy = st.selectbox("即時排序策略", ["依 今年來漲幅(%) 由高到低", "依 當前 RSI 由高到低 (動能強)", "依 當前 RSI 由低到高 (超跌區)"], key="t3_strat")
@@ -748,9 +751,16 @@ with tab3:
             elif "RSI 由高到低" in scan_strategy: df_results = df_results.sort_values(by="當前 RSI", ascending=False)
             elif "RSI 由低到高" in scan_strategy: df_results = df_results.sort_values(by="當前 RSI", ascending=True)
                 
-            if not scan_count.startswith("顯示全部"): 
-                df_results = df_results.head(int(scan_count))
-                
+            # 使用者可自由輸入顯示數量。
+            # 若輸入超過實際成功取得的資料筆數，直接顯示全部。
+            display_count = int(scan_count)
+            actual_count = len(df_results)
+
+            if display_count >= actual_count:
+                df_results = df_results.copy()
+            else:
+                df_results = df_results.head(display_count)
+
             display_df = df_results.reset_index(drop=True)
             display_df.index = display_df.index + 1
             
